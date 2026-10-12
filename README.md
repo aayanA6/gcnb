@@ -15,7 +15,7 @@ packages/shared/   zod schemas for every WebSocket event
 themes/*.json      one token file per theme (Cartoon, HUD, Nightwatch, Citadel, Phosphor)
 ```
 
-## Run it (Phase 1)
+## Run it
 
 Requirements: Node 20+ and pnpm 9 (`npm i -g pnpm@9`).
 
@@ -23,7 +23,7 @@ Requirements: Node 20+ and pnpm 9 (`npm i -g pnpm@9`).
 pnpm install
 ```
 
-Run the server and the web app in **two separate terminals**:
+For development, run the server and the web app in **two separate terminals**:
 
 ```sh
 # terminal 1: server on http://127.0.0.1:8787
@@ -34,6 +34,38 @@ pnpm --filter @gcnb/web dev
 ```
 
 Then open http://127.0.0.1:5173.
+
+For a production run, skip the second terminal: the server alone serves the built web app on :8787.
+
+```sh
+pnpm build:plugin   # or just: pnpm --filter @gcnb/web build
+GCNB_WEB_DIR=apps/web/dist pnpm --filter @gcnb/server start
+```
+
+### Install as a Claude Code plugin
+
+```
+/plugin marketplace add aayanA6/gcnb
+/plugin install gcnb@gcnb
+```
+
+`dist/server` and `dist/web` are committed, so installing needs no build step. `/gcnb` starts the bundled server detached and opens a browser tab; `/gcnb stop` stops it; `/gcnb status` reports whether it's running. The server outlives your Claude Code session — SQLite, pfps, VAPID keys and the server's installed `node_modules` live in `${CLAUDE_PLUGIN_DATA}`, never in the plugin's own folder, so they survive plugin updates. Put `ANTHROPIC_API_KEY=...` in `${CLAUDE_PLUGIN_DATA}/.env` the same way the repo's own `.env` supplies it in development.
+
+If you change the server or web app, run `pnpm build:plugin` and commit the result before publishing an update.
+
+### Phone (`tailscale serve`)
+
+```sh
+pnpm build:plugin        # or just: pnpm --filter @gcnb/web build
+pnpm --filter @gcnb/server start
+tailscale serve --bg 8787
+```
+
+Open `https://<machine>.<tailnet>.ts.net` on your phone, **Add to Home Screen**, then tap **Turn on pings** in the sidebar. iOS only delivers push notifications to a Home-Screen-installed PWA, not to Safari itself.
+
+### Voice
+
+Set `GCNB_WHISPER_URL` to a local Whisper server's inference endpoint, e.g. whisper.cpp's `whisper-server --convert` at `http://127.0.0.1:8080/inference`, and recordings are transcribed on your machine. `GCNB_WHISPER_MODEL` additionally names a model for OpenAI-style servers that require one. With no `GCNB_WHISPER_URL` set, the composer's mic button falls back to the browser's own speech recognition (Chrome/Edge; no server round-trip).
 
 ### ANTHROPIC_API_KEY
 
@@ -54,10 +86,15 @@ Optional settings:
 | `GCNB_MODEL` | `sonnet` | Model for new contacts whose agent file has no `model:` |
 | `GCNB_BUDGET_USD` | `2` | New contacts' spend cap (`maxBudgetUsd`) |
 | `GCNB_CWD` | repo root | Folder new contacts work in |
-| `GCNB_PERMISSION_MODE` | `bypassPermissions` | New contacts' permission mode (until Phase 3 approval cards) |
+| `GCNB_PERMISSION_MODE` | `bypassPermissions` | New contacts' permission mode; override per agent with `permissionMode:` in its file |
 | `GCNB_IDLE_MIN` | `30` | Close an idle contact's process after this many minutes; the next message resumes it |
 | `GCNB_DATA_DIR` | `.gcnb/` | Where `gcnb.db` lives |
+| `GCNB_WEB_DIR` | `apps/web/dist` | Where the server finds the built web app to serve |
 | `GCNB_ALLOWED_ORIGINS` | — | Extra browser origins allowed on the WebSocket (comma-separated) |
+| `GCNB_WHISPER_URL` | — | Local Whisper server for voice transcription, e.g. `http://127.0.0.1:8080/inference` |
+| `GCNB_WHISPER_MODEL` | — | Model name to send to an OpenAI-style Whisper server that requires one |
+| `GCNB_STOP_AFTER_MIN` | `0` (never) | Stop the server this many minutes after the last browser tab closes |
+| `GCNB_VAPID_SUBJECT` | repo URL | `subject` (mailto: or https: URL) sent with Web Push VAPID details |
 
 ### Check it
 
@@ -101,7 +138,7 @@ Each contact has its own SDK session. Restart the server, ask a contact "what di
 
 ## Security
 
-Agents can run commands on your machine. The server binds to `127.0.0.1` only, and the WebSocket and every non-GET request reject origins that aren't gcnb's own. New contacts default to `bypassPermissions`, so tools run without asking until approval cards ship in Phase 3. For a stricter contact, set `permissionMode: default` in its agent file or `GCNB_PERMISSION_MODE=default`.
+Agents can run commands on your machine. The server binds to `127.0.0.1` only, and the WebSocket and every non-GET request reject origins that aren't gcnb's own. New contacts default to `bypassPermissions`, so tools run without asking. For a stricter contact that uses approval cards instead, set `permissionMode: default` in its agent file or `GCNB_PERMISSION_MODE=default`.
 
 ## Themes
 

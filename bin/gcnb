@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// gcnb launcher: up / stop / status / install-deps. Plain CommonJS so it runs with no extension and
+// no package.json "type" needed, on Windows (Git Bash), macOS and Linux alike.
+'use strict'
+const fs = require('node:fs')
+const path = require('node:path')
+const os = require('node:os')
+const { spawn } = require('node:child_process')
+
+const root = path.dirname(__dirname) // bin/.. = the plugin root ($CLAUDE_PLUGIN_ROOT)
+const dataDir = process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), '.gcnb') // never write state under root
+fs.mkdirSync(dataDir, { recursive: true })
+const pidFile = path.join(dataDir, 'gcnb.pid')
+const logFile = path.join(dataDir, 'gcnb.log')
+const port = Number(process.env.GCNB_PORT || 8787)
+const url = `http://127.0.0.1:${port}`
+
+const argv = process.argv.slice(2)
+const cmd = argv.find((a) => !a.startsWith('--')) || 'up'
+const noOpen = argv.includes('--no-open')
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function health() {
+  try {
+    return (await fetch(`${url}/api/health`)).ok
+  } catch {
+    return false
+  }
+}
+
+function readPid() {
+  if (!fs.existsSync(pidFile)) return null
+  const pid = Number(fs.readFileSync(pidFile, 'utf8').trim())
+  return Number.isInteger(pid) ? pid : null
+}
+
+function readEnvFile(file) {
+  const out = {}
+  if (!fs.existsSync(file)) return out
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line.trim())
+    if (m) out[m[1]] = m[2]
+  }
+  return out
+}
+
+function openBrowser(u) {
+  if (process.platform === 'darwin') spawn('open', [u], { stdio: 'ignore', detached: true }).unref()
+  else if (process.platform === 'win32') spawn('cmd', ['/c', 'start', '""', u], { stdio: 'ignore', detached: true }).unref()
+  else spawn('xdg-open', [u], { stdio: 'ignore', detached: true }).unref()
+}
+
+async function up() {
+  const pid = readPid()
+  if (pid && alive(pid) && (await health())) {
+    if (!noOpen) openBrowser(url)
+    console.log(`gcnb already running at ${url}`)
+    return
+  }
+
+  // ESM ignores NODE_PATH, so the bundled server is copied next to the node_modules installed for it
+  // (by `install-deps`, below): module resolution then finds them by walking up from app/ to data/.
+  const appDir = path.join(dataDir, 'app')
+  fs.mkdirSync(appDir, { recursive: true })
+  fs.copyFileSync(path.join(root, 'dist', 'server', 'index.mjs'), path.join(appDir, 'index.mjs'))
+
+  const cwd = process.env.GCNB_CWD || process.cwd()
+  const env = {
+    ...process.env,
+    ...readEnvFile(path.join(dataDir, '.env')), // ANTHROPIC_API_KEY and friends
+    GCNB_DATA_DIR: dataDir,
+    GCNB_WEB_DIR: path.join(root, 'dist', 'web'),
+    GCNB_AGENTS_DIR: path.join(cwd, '.claude', 'agents'),
+    GCNB_CWD: cwd,
+  }
+  const out = fs.openSync(logFile, 'a')
+  const child = spawn(process.execPath, [path.join(appDir, 'index.mjs')], { cwd: appDir, env, detached: true, stdio: ['ignore', out, out] })
+  child.unref()
+  fs.writeFileSync(pidFile, String(child.pid))
+
+  for (let i = 0; i < 20 && !(await health()); i++) await new Promise((r) => setTimeout(r, 300))
+  if (!noOpen) openBrowser(url)
+  console.log(`gcnb started at ${url}`)
+}
+
+function stop() {
+  const pid = readPid()
+  if (pid) {
+    try {
+      process.kill(pid)
+    } catch {}
+  }
+  fs.rmSync(pidFile, { force: true })
+  console.log('gcnb stopped')
+}
+
+async function status() {
+  const pid = readPid()
+  const running = !!pid && alive(pid) && (await health())
+  console.log(running ? `gcnb running at ${url}` : 'gcnb not running')
+}
+
+// SessionStart hook: install (or update) the server's prod dependencies into $CLAUDE_PLUGIN_DATA
+// whenever the shipped manifest (dist/server/package.json) differs from the copy already installed.
+async function installDeps() {
+  const manifestSrc = path.join(root, 'dist', 'server', 'package.json')
+  const manifestDst = path.join(dataDir, 'package.json')
+  if (!fs.existsSync(manifestSrc)) return console.log('gcnb: no dist/server/package.json (run `pnpm build:plugin`)')
+  if (fs.existsSync(manifestDst) && fs.readFileSync(manifestSrc, 'utf8') === fs.readFileSync(manifestDst, 'utf8')) return console.log('gcnb: deps up to date')
+  fs.copyFileSync(manifestSrc, manifestDst)
+  console.log('gcnb: installing server dependencies...')
+  await new Promise((resolve, reject) => {
+    const p = spawn(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--omit=dev'], { cwd: dataDir, stdio: 'inherit' })
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`npm install exited ${code}`))))
+  })
+}
+
+;(async () => {
+  if (cmd === 'up') await up()
+  else if (cmd === 'stop') stop()
+  else if (cmd === 'status') await status()
+  else if (cmd === 'install-deps') await installDeps()
+  else console.log('usage: gcnb up|stop|status [--no-open]')
+})().catch((err) => {
+  console.error(String(err?.message ?? err))
+  process.exitCode = 1
+})

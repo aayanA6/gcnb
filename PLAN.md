@@ -9,7 +9,7 @@ Source of truth: *gcnb — execution plan* (Sep 30, 2026). Each phase ends in so
 | **2. Contacts** | Load `.claude/agents`, contact list, pfp upload with an initials fallback, per-contact model, folder and budget, idle close (~30 min) and resume | Three contacts with separate sessions, all surviving a restart | ✅ Done (see notes) |
 | **3. See and steer** | Grey tool lines, approval cards with tapbacks, question chips, stop button (`Query.interrupt()`), spend on the contact card, "Open in terminal" | An agent asks to run a shell command and you approve it with a tapback | ✅ Built (see notes) |
 | **4. Group chat** | Threads and members, routing, `hand_off` tool (in-process MCP via `createSdkMcpServer()`), loop guards (4 hops, one turn per contact, group spend cap per hour) | Planner hands to coder, coder to reviewer, reviewer reports back; a forced loop pauses at 4 hops | ✅ Built (see notes) |
-| **5. iMessage everywhere** | Light and dark themes, full visual polish from the UI templates, browser notifications, `tailscale serve`, installable PWA, voice (local Whisper), package as a Claude Code plugin (`/gcnb`) | Your phone buzzes when an agent needs you and you approve from the phone | Next |
+| **5. iMessage everywhere** | Light and dark themes, full visual polish from the UI templates, browser notifications, `tailscale serve`, installable PWA, voice (local Whisper), package as a Claude Code plugin (`/gcnb`) | Your phone buzzes when an agent needs you and you approve from the phone | ✅ Built (see notes) |
 | **6. Stretch** | Agents that text first on a schedule, import an existing CLI session as a contact, agent view bridge experiment, Tauri window | Pick based on what you actually miss after using Phase 5 | |
 
 ## Phase 1 notes
@@ -124,6 +124,34 @@ Not done yet:
 - The hourly group spend is kept in memory, so a restart forgets the last hour.
 - The hop limit is the global `HOP_LIMIT = 4`, not a per-group setting.
 - Typing indicators are per contact, so a member busy in a DM won't show as typing in a group.
+
+## Phase 5 notes
+
+What shipped:
+- **Themes:** light and dark palettes plus a system-matching Auto mode, and a new Cartoon Night theme (`themes/cartoon-night.json`) alongside the existing five.
+- **Phone layout:** a responsive single-column layout for narrow viewports, with search, filters, unread and date pills in the contact list.
+- **Notifications:** Web Push (`apps/server/src/push.ts`, VAPID keys kept in the data dir) with an in-page fallback and visible-tab gating — the server pushes only while no open tab is looking at gcnb (`notify()` in `apps/server/src/index.ts`).
+- **PWA:** manifest, service worker and icon set under `apps/web/public/`, so the app installs to a phone's home screen.
+- **Tailscale-safe origin check:** `originAllowed()` (`apps/server/src/http.ts`) allows loopback and the browser's own `*.ts.net` HTTPS origin, matching Origin against the request's own Host so a DNS-rebinding attempt on a foreign host is refused even when its Host header is made to match. The server also serves the built web app itself (`serveWeb()`), so `tailscale serve` has one target.
+- **Voice:** recordings POST to `/api/transcribe`, forwarded to a local Whisper server (`GCNB_WHISPER_URL`, e.g. whisper.cpp's `whisper-server --convert`; `GCNB_WHISPER_MODEL` for OpenAI-style servers). With no server configured, the composer falls back to the browser's own speech recognition.
+- **Claude Code plugin:** the repo root is the plugin root (`.claude-plugin/plugin.json` + `marketplace.json`, `skills/gcnb/SKILL.md`, `bin/gcnb`, `hooks/hooks.json`). `pnpm build:plugin` (`scripts/build-plugin.mjs`) builds the web app into `dist/web` and esbuild-bundles the server into `dist/server/index.mjs` (`@gcnb/shared` bundled in, real npm deps externalized), plus a trimmed `dist/server/package.json`. `/gcnb up` copies the bundle into `${CLAUDE_PLUGIN_DATA}/app`, starts it detached, and opens a browser tab; `/gcnb stop` and `/gcnb status` manage it. A `SessionStart` hook (`hooks/hooks.json` → `gcnb install-deps`) installs the server's prod dependencies into `${CLAUDE_PLUGIN_DATA}` whenever the shipped manifest changes.
+
+Verified:
+- `pnpm --filter @gcnb/server test`: `originAllowed()` (loopback, the vite dev proxy's Host-preserving case, `*.ts.net` over https only, a foreign origin, and a DNS-rebinding attempt where Origin and Host are made to match on a non-loopback host) and `noteFor()` (a pending card is urgent, a group adds "in #title", a paused-group system line is urgent, an agent reply is a non-urgent per-thread tag, and a user line / tool line / already-answered card produce no notification).
+- `pnpm --filter @gcnb/server typecheck`.
+- `pnpm build:plugin` produces `dist/web/index.html` and `dist/server/index.mjs`; `node --check dist/server/index.mjs` passes.
+- A bounded smoke test of `bin/gcnb` against a temp `${CLAUDE_PLUGIN_DATA}` (node_modules pointed at the repo's own, since `install-deps` wasn't exercised): `up` copies the bundle, starts the server and waits for `/api/health`; a second `up` recognizes it's already running; `stop` kills it and clears the PID file; `status` reports correctly before, during and after, and nothing was left running.
+- Not run here: the web app's own typecheck/build (themes, phone layout, search/filters, PWA and push UI were mid-edit at the same time), and `gcnb install-deps`'s actual `npm install` into `${CLAUDE_PLUGIN_DATA}`.
+
+Not done yet:
+- `app_settings` table: theme and other prefs still live in `localStorage`, not SQLite.
+- Piper read-aloud (agent replies spoken back).
+- A settings screen built from the UI template.
+- Per-contact worktrees.
+
+## Phase 6
+
+Deliberately deferred, per the plan: pick based on what you actually miss after using Phase 5.
 
 ## Decisions
 

@@ -10,6 +10,8 @@ import { parseAgentFile, withModel } from './agents.ts'
 import { AgentRuntime, describeTool, spendAfterResult } from './runtime/agent.ts'
 import type { CanUseTool } from '@anthropic-ai/claude-agent-sdk'
 import { Router, type Deliverable, type Delivery } from './router.ts'
+import { originAllowed } from './http.ts'
+import { noteFor, type Message } from '@gcnb/shared'
 
 const dir = mkdtempSync(join(tmpdir(), 'gcnb-'))
 const file = join(dir, 'test.db')
@@ -183,6 +185,41 @@ assert.deepEqual(spendAfterResult(0.5, 0.9, false), { spent: 1.4, lifetime: fals
   assert.deepEqual(migrated.threads().map((t) => [t.id, t.leadContactId, t.hourlyCapUsd]), [['dm-x', null, null]])
   migrated.close()
   rmSync(dir4, { recursive: true, force: true })
+}
+
+// originAllowed: same-origin loopback (including the vite dev proxy, which keeps the browser's Host
+// header), tailscale's https *.ts.net, and the extra-origins allowlist; denies everything else,
+// including a DNS-rebinding attempt where Origin and Host are made to match on a non-loopback host.
+{
+  const noExtra = new Set<string>()
+  assert.equal(originAllowed('http://127.0.0.1:8787', '127.0.0.1:8787', noExtra), true)
+  assert.equal(originAllowed('http://127.0.0.1:5173', '127.0.0.1:5173', noExtra), true) // vite proxy keeps Host
+  assert.equal(originAllowed('https://box.tail1234.ts.net', 'box.tail1234.ts.net', noExtra), true)
+  assert.equal(originAllowed('http://box.tail1234.ts.net', 'box.tail1234.ts.net', noExtra), false) // tailscale needs https
+  assert.equal(originAllowed('http://evil.com', '127.0.0.1:8787', noExtra), false) // foreign origin, loopback host
+  assert.equal(originAllowed('http://evil.com:8787', 'evil.com:8787', noExtra), false) // rebinding: Host matches Origin, but neither is loopback/ts.net
+  assert.equal(originAllowed(undefined, '127.0.0.1:8787', noExtra), false)
+  assert.equal(originAllowed('https://extra.example', 'anything', new Set(['https://extra.example'])), true)
+}
+
+// noteFor: what pings your phone (an open card, or a paused group) vs. a finished reply vs. nothing.
+{
+  const msg = (over: Partial<Message> & { body: Message['body'] }): Message => ({ id: 'm1', threadId: 'dm-coder', sender: 'agent', contactId: 'coder', kind: 'text', createdAt: 0, ...over })
+  const nameOf = () => 'Coder'
+
+  const card = msg({ kind: 'approval', body: { text: 'Run tests', detail: 'pnpm test', status: 'pending' } })
+  assert.deepEqual(noteFor(card, nameOf), { title: 'Coder needs you', body: 'Run tests: pnpm test', threadId: 'dm-coder', tag: 'dm-coder:needs', urgent: true })
+  assert.equal(noteFor(card, nameOf, 'launch crew')!.title, 'Coder needs you in #launch crew')
+
+  const paused = msg({ sender: 'system', contactId: null, kind: 'status', body: { text: 'Paused after 4 hand-offs, waiting for you' } })
+  assert.deepEqual(noteFor(paused, nameOf, 'launch crew'), { title: '#launch crew paused', body: 'Paused after 4 hand-offs, waiting for you', threadId: 'dm-coder', tag: 'dm-coder:needs', urgent: true })
+
+  const reply = msg({ sender: 'agent', kind: 'text', body: { text: 'done' } })
+  assert.deepEqual(noteFor(reply, nameOf), { title: 'Coder', body: 'done', threadId: 'dm-coder', tag: 'dm-coder', urgent: false })
+
+  assert.equal(noteFor(msg({ sender: 'user', kind: 'text', body: { text: 'hi' } }), nameOf), null)
+  assert.equal(noteFor(msg({ kind: 'tool', body: { text: 'Ran npm test' } }), nameOf), null)
+  assert.equal(noteFor(msg({ kind: 'approval', body: { text: 'x', status: 'answered' } }), nameOf), null)
 }
 
 // Grey tool lines

@@ -1,0 +1,12 @@
+{
+  "name": "gcnb",
+  "owner": { "name": "Aayan" },
+  "description": "gcnb: an iMessage-style chat UI for Claude Code agents",
+  "plugins": [
+    {
+      "name": "gcnb",
+      "source": "./",
+      "description": "iMessage-style chat UI for your Claude Code agents"
+    }
+  ]
+}
