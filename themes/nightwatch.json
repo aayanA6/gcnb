@@ -1,0 +1,35 @@
+{
+  "name": "Nightwatch",
+  "description": "Midnight lab: black steel, cold gray monitors, signal-yellow alerts",
+  "dark": true,
+  "fontsUrl": "https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Mono&display=swap",
+  "colors": {
+    "app": "#060809",
+    "panel": "#0c0f12",
+    "ink": "#d5dbe0",
+    "muted": "#7c8791",
+    "line": "#2c343b",
+    "accent": "#ffd400",
+    "on-accent": "#0a0a0a",
+    "me": "#ffd400",
+    "on-me": "#0a0a0a",
+    "them": "#cfd8de",
+    "on-them": "#0d1114",
+    "field": "#05070a",
+    "on-field": "#d5dbe0",
+    "alert": "#ffd400",
+    "on-alert": "#0a0a0a",
+    "ok": "#9fb3c0"
+  },
+  "fonts": {
+    "body": "'IBM Plex Sans', system-ui, sans-serif",
+    "display": "'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif",
+    "mono": "'IBM Plex Mono', ui-monospace, monospace",
+    "display-case": "uppercase",
+    "display-tracking": "0.22em"
+  },
+  "radii": { "panel": "6px", "bubble": "4px", "button": "3px" },
+  "borders": { "panel": "1px solid #2c343b", "bubble": "1px solid #3a444c", "button": "1px solid #3a444c" },
+  "shadows": { "panel": "0 0 0 1px #000, 0 10px 30px rgba(0,0,0,0.6)", "bubble": "0 0 14px rgba(255, 212, 0, 0.12)", "button": "0 0 10px rgba(255, 212, 0, 0.25)" },
+  "wallpaper": "repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 3px), linear-gradient(#0b0e11, #080a0c)"
+}

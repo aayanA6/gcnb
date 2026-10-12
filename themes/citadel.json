@@ -1,0 +1,35 @@
+{
+  "name": "Citadel",
+  "description": "Candlelit castle study: iron, gold filigree, parchment, a crimson gem",
+  "dark": true,
+  "fontsUrl": "https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Cormorant+Garamond:wght@500;600&family=IBM+Plex+Mono&display=swap",
+  "colors": {
+    "app": "#110c08",
+    "panel": "#1a130d",
+    "ink": "#ecdcb8",
+    "muted": "#a8916a",
+    "line": "#8a6d3b",
+    "accent": "#c9a24a",
+    "on-accent": "#1a1208",
+    "me": "#6b1020",
+    "on-me": "#f3e3c3",
+    "them": "#e9d6a8",
+    "on-them": "#2a1d10",
+    "field": "#0f0a06",
+    "on-field": "#ecdcb8",
+    "alert": "#7a1424",
+    "on-alert": "#f3e3c3",
+    "ok": "#c9a24a"
+  },
+  "fonts": {
+    "body": "'Cormorant Garamond', Georgia, serif",
+    "display": "'Cinzel', 'Cormorant Garamond', serif",
+    "mono": "'IBM Plex Mono', ui-monospace, monospace",
+    "display-case": "uppercase",
+    "display-tracking": "0.06em"
+  },
+  "radii": { "panel": "8px", "bubble": "10px", "button": "4px" },
+  "borders": { "panel": "1px solid #8a6d3b", "bubble": "1px solid #8a6d3b", "button": "1px solid #8a6d3b" },
+  "shadows": { "panel": "0 0 0 3px #1a130d, 0 0 0 4px #5a4422, 0 12px 30px rgba(0,0,0,0.6)", "bubble": "0 4px 14px rgba(0,0,0,0.45)", "button": "0 2px 8px rgba(0,0,0,0.5)" },
+  "wallpaper": "repeating-linear-gradient(45deg, rgba(201,162,74,0.035) 0 2px, transparent 2px 9px), radial-gradient(ellipse at 20% 100%, rgba(201,120,40,0.14), transparent 55%), #15100b"
+}

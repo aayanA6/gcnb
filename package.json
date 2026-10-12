@@ -1,0 +1,17 @@
+{
+  "name": "gcnb",
+  "private": true,
+  "description": "gcnb (gc, no burger): an iMessage-style chat UI for Claude Code agents",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+  }
+}

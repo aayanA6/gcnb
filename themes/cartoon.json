@@ -1,0 +1,35 @@
+{
+  "name": "Cartoon",
+  "description": "Chunky ink outlines, hard shadows, bubbly type",
+  "dark": false,
+  "fontsUrl": "https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600;700&family=Fredoka:wght@600;700&family=JetBrains+Mono&display=swap",
+  "colors": {
+    "app": "#ece9ff",
+    "panel": "#ffffff",
+    "ink": "#1d1b2e",
+    "muted": "#5e5a7a",
+    "line": "#1d1b2e",
+    "accent": "#ffd23f",
+    "on-accent": "#1d1b2e",
+    "me": "#3b5bfd",
+    "on-me": "#ffffff",
+    "them": "#ffffff",
+    "on-them": "#1d1b2e",
+    "field": "#f1f0fb",
+    "on-field": "#1d1b2e",
+    "alert": "#ff6b4a",
+    "on-alert": "#1d1b2e",
+    "ok": "#3ddc97"
+  },
+  "fonts": {
+    "body": "'Baloo 2', system-ui, sans-serif",
+    "display": "'Fredoka', 'Baloo 2', system-ui, sans-serif",
+    "mono": "'JetBrains Mono', ui-monospace, monospace",
+    "display-case": "none",
+    "display-tracking": "0"
+  },
+  "radii": { "panel": "22px", "bubble": "20px", "button": "999px" },
+  "borders": { "panel": "2.5px solid #1d1b2e", "bubble": "2.5px solid #1d1b2e", "button": "2.5px solid #1d1b2e" },
+  "shadows": { "panel": "5px 5px 0 #1d1b2e", "bubble": "3px 3px 0 #1d1b2e", "button": "3px 3px 0 #1d1b2e" },
+  "wallpaper": "radial-gradient(#cfcae8 1.3px, transparent 1.4px) 0 0 / 18px 18px, #fbfaff"
+}

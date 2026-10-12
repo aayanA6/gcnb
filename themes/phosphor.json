@@ -1,0 +1,35 @@
+{
+  "name": "Phosphor",
+  "description": "Green-screen terminal straight out of the 80s",
+  "dark": true,
+  "fontsUrl": "https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:wght@400;600&display=swap",
+  "colors": {
+    "app": "#000700",
+    "panel": "#010c02",
+    "ink": "#7dff9a",
+    "muted": "#3fae5a",
+    "line": "#2fd65a",
+    "accent": "#33ff66",
+    "on-accent": "#001a05",
+    "me": "#33ff66",
+    "on-me": "#001a05",
+    "them": "transparent",
+    "on-them": "#7dff9a",
+    "field": "#000700",
+    "on-field": "#7dff9a",
+    "alert": "#ffb347",
+    "on-alert": "#1a0f00",
+    "ok": "#33ff66"
+  },
+  "fonts": {
+    "body": "'IBM Plex Mono', ui-monospace, monospace",
+    "display": "'VT323', 'IBM Plex Mono', monospace",
+    "mono": "'IBM Plex Mono', ui-monospace, monospace",
+    "display-case": "uppercase",
+    "display-tracking": "0.08em"
+  },
+  "radii": { "panel": "0", "bubble": "0", "button": "0" },
+  "borders": { "panel": "1px solid #2fd65a", "bubble": "1px dashed #2fd65a", "button": "1px solid #2fd65a" },
+  "shadows": { "panel": "0 0 18px rgba(51, 255, 102, 0.18)", "bubble": "0 0 8px rgba(51, 255, 102, 0.15)", "button": "0 0 10px rgba(51, 255, 102, 0.35)" },
+  "wallpaper": "repeating-linear-gradient(0deg, rgba(51,255,102,0.04) 0 1px, transparent 1px 3px), #010a02"
+}

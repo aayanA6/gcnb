@@ -1,0 +1,35 @@
+{
+  "name": "HUD",
+  "description": "Holographic workshop: glass panels, cyan light, warm glow behind",
+  "dark": true,
+  "fontsUrl": "https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700&family=Rajdhani:wght@500;600&family=Share+Tech+Mono&display=swap",
+  "colors": {
+    "app": "#02060b",
+    "panel": "rgba(6, 22, 34, 0.82)",
+    "ink": "#d4f3ff",
+    "muted": "#6fa6bd",
+    "line": "rgba(92, 225, 255, 0.45)",
+    "accent": "#ffad5c",
+    "on-accent": "#1a0d00",
+    "me": "rgba(92, 225, 255, 0.10)",
+    "on-me": "#d4f3ff",
+    "them": "rgba(8, 30, 46, 0.85)",
+    "on-them": "#d4f3ff",
+    "field": "rgba(0, 10, 18, 0.9)",
+    "on-field": "#d4f3ff",
+    "alert": "#ff8a5c",
+    "on-alert": "#1a0d00",
+    "ok": "#5ce1ff"
+  },
+  "fonts": {
+    "body": "'Rajdhani', system-ui, sans-serif",
+    "display": "'Orbitron', 'Rajdhani', sans-serif",
+    "mono": "'Share Tech Mono', ui-monospace, monospace",
+    "display-case": "uppercase",
+    "display-tracking": "0.12em"
+  },
+  "radii": { "panel": "10px", "bubble": "10px", "button": "4px" },
+  "borders": { "panel": "1px solid rgba(92, 225, 255, 0.45)", "bubble": "1px solid rgba(92, 225, 255, 0.5)", "button": "1px solid rgba(92, 225, 255, 0.6)" },
+  "shadows": { "panel": "0 0 24px rgba(92, 225, 255, 0.18), inset 0 0 30px rgba(92, 225, 255, 0.05)", "bubble": "0 0 12px rgba(92, 225, 255, 0.15)", "button": "0 0 10px rgba(92, 225, 255, 0.3)" },
+  "wallpaper": "linear-gradient(rgba(92,225,255,0.06) 1px, transparent 1px) 0 0 / 28px 28px, linear-gradient(90deg, rgba(92,225,255,0.06) 1px, transparent 1px) 0 0 / 28px 28px, radial-gradient(ellipse at 70% 0%, rgba(255,150,60,0.12), transparent 60%), #03101a"
+}
