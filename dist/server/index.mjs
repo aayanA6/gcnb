@@ -643,7 +643,7 @@ ${PERSONA}`,
             if (!m.parent_tool_use_id && !this.pending.size) this.setTyping(true);
             break;
           case "assistant": {
-            if (m.parent_tool_use_id) break;
+            if (m.parent_tool_use_id || m.error) break;
             for (const b of m.message.content) {
               if (b.type === "text" && b.text.trim() && !group) this.post("agent", "text", b.text.trim());
               if (b.type === "tool_use" && b.name !== "AskUserQuestion" && b.name !== HAND_OFF)

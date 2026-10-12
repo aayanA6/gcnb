@@ -342,7 +342,8 @@ export class AgentRuntime {
             if (!m.parent_tool_use_id && !this.pending.size) this.setTyping(true)
             break
           case 'assistant': {
-            if (m.parent_tool_use_id) break // subagent chatter stays out of the chat
+            // Subagent chatter stays out of the chat; an API error (billing, auth, ...) shows as the grey status line instead of a bubble.
+            if (m.parent_tool_use_id || m.error) break
             for (const b of m.message.content) {
               // In a DM every text block is a bubble; in a group only the turn's final text posts (at result).
               if (b.type === 'text' && b.text.trim() && !group) this.post('agent', 'text', b.text.trim())
