@@ -65,7 +65,7 @@ Open `https://<machine>.<tailnet>.ts.net` on your phone, **Add to Home Screen**,
 
 ### Voice
 
-Set `GCNB_WHISPER_URL` to a local Whisper server's inference endpoint, e.g. whisper.cpp's `whisper-server --convert` at `http://127.0.0.1:8080/inference`, and recordings are transcribed on your machine. `GCNB_WHISPER_MODEL` additionally names a model for OpenAI-style servers that require one. With no `GCNB_WHISPER_URL` set, the composer's mic button falls back to the browser's own speech recognition (Chrome/Edge; no server round-trip).
+Set `GCNB_WHISPER_URL` to a local Whisper server's inference endpoint, e.g. whisper.cpp's `whisper-server --convert` at `http://127.0.0.1:8080/inference`, and recordings are transcribed on your machine. `GCNB_WHISPER_MODEL` additionally names a model for OpenAI-style servers that require one. With no `GCNB_WHISPER_URL` set, the composer's mic button falls back to the browser's own speech recognition (Chrome, Edge, Safari), which sends the audio to the browser vendor's cloud rather than keeping it on your machine.
 
 ### ANTHROPIC_API_KEY
 
