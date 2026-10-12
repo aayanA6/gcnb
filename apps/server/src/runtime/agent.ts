@@ -367,6 +367,15 @@ export class AgentRuntime {
       '--permission-prompt-tool', PERMISSION_PROMPT,
     ]
     const child = spawn(CLAUDE_BIN, args, { cwd: c.cwd, env: cliEnv(), windowsHide: true })
+    // Without this, a spawn failure (ENOENT when GCNB_CLAUDE_BIN is wrong, EACCES, ...) is an
+    // unhandled 'error' event on the ChildProcess, which Node rethrows and crashes the whole server.
+    child.on('error', (err) => {
+      if (this.child === child) {
+        this.post('system', 'status', `Agent error: ${err.message}`)
+        this.queue = []
+        this.close()
+      }
+    })
     this.child = child
     this.box = box
     void this.pumpStdin(child, box)

@@ -92,6 +92,7 @@ Optional settings:
 | `GCNB_PERMISSION_MODE` | `bypassPermissions` | New contacts' permission mode; override per agent with `permissionMode:` in its file |
 | `GCNB_IDLE_MIN` | `30` | Close an idle contact's process after this many minutes; the next message resumes it |
 | `GCNB_DATA_DIR` | `.gcnb/` | Where `gcnb.db` lives |
+| `GCNB_SETTING_SOURCES` | `project,local` | Which Claude Code settings each agent loads. Your global `~/.claude` settings (hooks, plugins) are skipped by default so a global hook can't answer tool prompts before gcnb's approval cards; set `user,project,local` to include them |
 | `GCNB_WEB_DIR` | `apps/web/dist` | Where the server finds the built web app to serve |
 | `GCNB_ALLOWED_ORIGINS` | — | Extra browser origins allowed on the WebSocket (comma-separated) |
 | `GCNB_WHISPER_URL` | — | Local Whisper server for voice transcription, e.g. `http://127.0.0.1:8080/inference` |

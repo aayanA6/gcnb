@@ -657,6 +657,13 @@ ${PERSONA}`,
       PERMISSION_PROMPT
     ];
     const child = spawn(CLAUDE_BIN, args, { cwd: c.cwd, env: cliEnv(), windowsHide: true });
+    child.on("error", (err) => {
+      if (this.child === child) {
+        this.post("system", "status", `Agent error: ${err.message}`);
+        this.queue = [];
+        this.close();
+      }
+    });
     this.child = child;
     this.box = box;
     void this.pumpStdin(child, box);
