@@ -7,6 +7,9 @@ import { ClientEvent, PERMISSION_MODES, type ServerEvent } from '@gcnb/shared'
 import { openDb } from './db.ts'
 import { loadAgents, setAgentModel } from './agents.ts'
 import { AgentRuntime } from './runtime/agent.ts'
+import { Router } from './router.ts'
+
+const GROUP_CAP = Number(process.env.GCNB_GROUP_HOURLY_CAP_USD ?? 5)
 
 const root = fileURLToPath(new URL('../../..', import.meta.url))
 const port = Number(process.env.GCNB_PORT ?? 8787)
@@ -65,8 +68,24 @@ for (const a of db.pendingActions()) {
   db.patchMessageBody(JSON.parse(a.payloadJson).messageId, { status: 'expired' })
 }
 
-const runtimes = new Map(agentFiles.map((a) => [a.name, new AgentRuntime(db, a.name, `dm-${a.name}`, a, broadcast)]))
-// Only contacts that still have an agent file show up; a deleted file hides the contact but keeps its history.
+const runtimes = new Map<string, AgentRuntime>()
+const router = new Router(db, runtimes, broadcast)
+for (const a of agentFiles)
+  runtimes.set(
+    a.name,
+    new AgentRuntime(db, a.name, a, broadcast, {
+      handOff: (from, d, to, message) => router.handOff(from, d, to, message),
+      groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
+      isGroup: (threadId) => threadId.startsWith('g-'),
+    }),
+  )
+
+// Starter group for the trio, so the planner -> coder -> reviewer hand-off chain works out of the box.
+const trio = ['planner', 'coder', 'reviewer']
+if (trio.every((id) => runtimes.has(id)) && !db.threads().some((t) => t.kind === 'group'))
+  db.createGroup({ title: 'launch crew', contactIds: trio, leadContactId: 'planner', hourlyCapUsd: GROUP_CAP })
+
+// Only threads whose members all still have agent files show up; a deleted file hides them but keeps history.
 const visibleThreads = () => db.threads().filter((t) => t.contactIds.every((id) => runtimes.has(id)))
 
 const snapshot = (): ServerEvent => {
@@ -74,10 +93,10 @@ const snapshot = (): ServerEvent => {
   return {
     type: 'snapshot',
     contacts: db.contacts().filter((c) => runtimes.has(c.id)),
-    threads,
+    threads: threads.map(router.withSpend),
     messages: threads.flatMap((t) => db.recentMessages(t.id)),
     agents: [...runtimes.values()].map((r) => r.state()),
-    typing: [...runtimes.values()].filter((r) => r.typing).map((r) => r.contactId),
+    typing: [...runtimes.values()].filter((r) => r.typing).map((r) => ({ contactId: r.contactId, threadId: r.threadId })),
   }
 }
 
@@ -85,16 +104,13 @@ const systemLine = (contactId: string, text: string) =>
   broadcast({ type: 'message', message: db.addMessage({ threadId: `dm-${contactId}`, sender: 'system', contactId, kind: 'status', body: { text } }) })
 
 function handle(ev: ClientEvent) {
-  if (ev.type === 'send') {
-    // Phase 2 threads are DMs: exactly one member.
-    const rt = runtimes.get(db.threadContactIds(ev.threadId)[0] ?? '')
-    if (!rt) return
-    const state = rt.state()
-    const message = db.addMessage({ threadId: ev.threadId, sender: 'user', contactId: null, kind: 'text', body: { text: ev.text, delivered: state.live } })
-    broadcast({ type: 'message', message })
-    if (state.live) rt.send(ev.text)
-    else systemLine(rt.contactId, `Not delivered: ${state.reason}`)
-    return
+  if (ev.type === 'send') return router.post(ev.threadId, ev.text)
+
+  if (ev.type === 'createGroup') {
+    const ids = [...new Set(ev.contactIds)].filter((id) => runtimes.has(id))
+    if (ids.length < 2 || !ids.includes(ev.leadContactId)) return app.log.warn('createGroup needs 2+ contacts and a lead among them')
+    const thread = db.createGroup({ title: ev.title.replace(/^#/, ''), contactIds: ids, leadContactId: ev.leadContactId, hourlyCapUsd: ev.hourlyCapUsd ?? GROUP_CAP })
+    return broadcast({ type: 'thread', thread: router.withSpend(thread) })
   }
 
   if (ev.type === 'answer') {
@@ -183,7 +199,7 @@ app.get<{ Params: { file: string } }>('/api/avatars/:file', async (req, reply) =
 app.get('/api/health', async () => ({ ok: true, agents: [...runtimes.values()].map((r) => ({ ...r.state(), running: r.running })) }))
 
 const shutdown = async () => {
-  for (const r of runtimes.values()) r.close()
+  for (const r of runtimes.values()) r.shutdown()
   await app.close()
   db.close()
   process.exit(0)

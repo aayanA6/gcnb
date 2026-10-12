@@ -24,8 +24,18 @@ export const Thread = z.object({
   title: z.string(),
   createdAt: z.number(),
   contactIds: z.array(z.string()), // thread_members
+  // Groups only: who gets un-mentioned posts, and the spend cap on top of each contact's own.
+  leadContactId: z.string().nullable(),
+  hourlyCapUsd: z.number().nullable(),
+  spentHourUsd: z.number().optional(), // computed by the server
 })
 export type Thread = z.infer<typeof Thread>
+
+export const HOP_LIMIT = 4 // agent-to-agent hand-offs in a row before the group pauses for you
+
+// Typing is per contact, tagged with the thread its current turn belongs to.
+export const Typing = z.object({ contactId: z.string(), threadId: z.string() })
+export type Typing = z.infer<typeof Typing>
 
 // One AskUserQuestion question, rendered as quick-reply chips plus "Other".
 export const Question = z.object({
@@ -54,6 +64,8 @@ export const Message = z.object({
       canAlways: z.boolean().optional(),
       questions: z.array(Question).optional(),
       answers: z.record(z.string(), z.string()).optional(),
+      handoff: z.object({ from: z.string(), to: z.string() }).optional(), // hand-off pill (contact ids)
+      costUsd: z.number().optional(), // what the turn behind a group bubble cost
     })
     .passthrough(),
   createdAt: z.number(), // epoch ms
@@ -87,7 +99,14 @@ export const ClientEvent = z.discriminatedUnion('type', [
     permissionMode: z.enum(PERMISSION_MODES).optional(),
   }),
   z.object({ type: z.literal('answer'), actionId: z.string(), decision: Decision.optional(), answers: z.record(z.string(), z.string().max(5000)).optional() }),
-  z.object({ type: z.literal('interrupt'), contactId: z.string() }), // stop button
+  z.object({ type: z.literal('interrupt'), contactId: z.string() }), // stop button; also clears that contact's queue
+  z.object({
+    type: z.literal('createGroup'),
+    title: z.string().trim().min(1).max(40),
+    contactIds: z.array(z.string()).min(2).max(12),
+    leadContactId: z.string(),
+    hourlyCapUsd: z.number().positive().max(10000).optional(),
+  }),
 ])
 export type ClientEvent = z.infer<typeof ClientEvent>
 
@@ -98,11 +117,12 @@ export const ServerEvent = z.discriminatedUnion('type', [
     threads: z.array(Thread),
     messages: z.array(Message),
     agents: z.array(AgentState),
-    typing: z.array(z.string()), // contact ids currently typing
+    typing: z.array(Typing),
   }),
   z.object({ type: z.literal('message'), message: Message }),
-  z.object({ type: z.literal('typing'), contactId: z.string(), on: z.boolean() }),
+  z.object({ type: z.literal('typing'), contactId: z.string(), threadId: z.string(), on: z.boolean() }),
   z.object({ type: z.literal('agent'), agent: AgentState }),
   z.object({ type: z.literal('contact'), contact: Contact }),
+  z.object({ type: z.literal('thread'), thread: Thread }), // new group, or a group's hourly spend changed
 ])
 export type ServerEvent = z.infer<typeof ServerEvent>

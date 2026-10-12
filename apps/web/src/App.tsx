@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import { PERMISSION_MODES, ServerEvent, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread } from '@gcnb/shared'
+import { HOP_LIMIT, PERMISSION_MODES, ServerEvent, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread, type Typing } from '@gcnb/shared'
 import { applyTheme, themes } from './theme.ts'
 
 type State = {
@@ -8,7 +8,7 @@ type State = {
   threads: Thread[]
   messages: Message[]
   agents: Record<string, AgentState>
-  typing: string[]
+  typing: Typing[]
 }
 type Action = ServerEvent | { type: 'connected'; on: boolean }
 
@@ -24,8 +24,14 @@ function reduce(s: State, e: Action): State {
       return s.messages.some((m) => m.id === e.message.id)
         ? { ...s, messages: s.messages.map((m) => (m.id === e.message.id ? e.message : m)) }
         : { ...s, messages: [...s.messages, e.message] }
-    case 'typing':
-      return { ...s, typing: e.on ? [...new Set([...s.typing, e.contactId])] : s.typing.filter((id) => id !== e.contactId) }
+    case 'typing': {
+      const rest = s.typing.filter((t) => t.contactId !== e.contactId)
+      return { ...s, typing: e.on ? [...rest, { contactId: e.contactId, threadId: e.threadId }] : rest }
+    }
+    case 'thread':
+      return s.threads.some((t) => t.id === e.thread.id)
+        ? { ...s, threads: s.threads.map((t) => (t.id === e.thread.id ? e.thread : t)) }
+        : { ...s, threads: [...s.threads, e.thread] }
     case 'agent':
       return { ...s, agents: { ...s.agents, [e.agent.contactId]: e.agent } }
     case 'contact':
@@ -115,8 +121,15 @@ function Bubble({ m, showReceipt }: { m: Message; showReceipt: boolean }) {
 type Answer = { decision?: Decision; answers?: Record<string, string> }
 
 // Small grey line between bubbles: what the agent is doing ("Read src/auth.ts", "Ran npm test").
-function ToolLine({ m }: { m: Message }) {
-  return <div className="b-dashed self-start rounded-button px-3 py-0.5 font-mono text-xs text-muted">{m.body.text}</div>
+// In a group each line carries the member's pfp, so the group doubles as "what is everyone doing".
+function ToolLine({ m, c }: { m: Message; c?: Contact }) {
+  return (
+    <div className="b-dashed flex items-center gap-1.5 self-start rounded-button px-3 py-0.5 font-mono text-xs text-muted">
+      {c && <Avatar c={c} size="size-4 text-[7px]" />}
+      {c && <span className="font-body">{c.displayName}</span>}
+      {m.body.text}
+    </div>
+  )
 }
 
 const OUTCOME: Record<string, string> = {
@@ -218,7 +231,7 @@ function QuestionCard({ m, onAnswer }: { m: Message; onAnswer: (a: Answer) => vo
   )
 }
 
-function Composer({ name, disabled, onSend }: { name: string; disabled: boolean; onSend: (text: string) => void }) {
+function Composer({ name, mentions, disabled, onSend }: { name: string; mentions?: string[]; disabled: boolean; onSend: (text: string) => void }) {
   const [text, setText] = useState('')
   const submit = () => {
     const t = text.trim()
@@ -227,7 +240,18 @@ function Composer({ name, disabled, onSend }: { name: string; disabled: boolean;
     setText('')
   }
   return (
-    <form className="rule-t flex gap-2 p-3" onSubmit={(e) => (e.preventDefault(), submit())}>
+    <div className="rule-t">
+      {mentions && (
+        <div className="flex flex-wrap items-center gap-2 px-3 pt-2 text-xs">
+          <span className="font-bold">Mention:</span>
+          {[...mentions, 'everyone'].map((n) => (
+            <button key={n} type="button" className="btn bg-panel px-2.5 py-0.5 text-ink" onClick={() => setText((t) => `${t}${t && !t.endsWith(' ') ? ' ' : ''}@${n} `)}>
+              @{n}
+            </button>
+          ))}
+        </div>
+      )}
+    <form className="flex gap-2 p-3" onSubmit={(e) => (e.preventDefault(), submit())}>
       <textarea
         rows={1}
         value={text}
@@ -246,6 +270,7 @@ function Composer({ name, disabled, onSend }: { name: string; disabled: boolean;
         Send
       </button>
     </form>
+    </div>
   )
 }
 
@@ -370,28 +395,165 @@ function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) 
   )
 }
 
+// Group pfps, overlapped.
+function Stack({ cs, size = 'size-7 text-[10px]' }: { cs: Contact[]; size?: string }) {
+  return (
+    <div className="flex shrink-0 -space-x-3">
+      {cs.slice(0, 3).map((c) => (
+        <Avatar key={c.id} c={c} size={size} />
+      ))}
+    </div>
+  )
+}
+
+// "Pip → Bolt  Pip handed off to Bolt"
+function HandoffPill({ m, from, to }: { m: Message; from?: Contact; to?: Contact }) {
+  return (
+    <div className="btn flex items-center gap-1.5 self-center bg-accent px-3 py-1 text-sm text-on-accent">
+      {from && <Avatar c={from} size="size-6 text-[9px]" />}
+      <span aria-hidden>→</span>
+      {to && <Avatar c={to} size="size-6 text-[9px]" />}
+      <span className="ml-1 font-bold">{m.body.text}</span>
+    </div>
+  )
+}
+
+function NewGroup({ contacts, onCreate, onCancel }: { contacts: Contact[]; onCreate: (g: Extract<ClientEvent, { type: 'createGroup' }>) => void; onCancel: () => void }) {
+  const [title, setTitle] = useState('')
+  const [ids, setIds] = useState(contacts.map((c) => c.id))
+  const [lead, setLead] = useState(contacts[0]?.id ?? '')
+  const [cap, setCap] = useState('5')
+  const ok = title.trim() && ids.length >= 2 && ids.includes(lead) && Number(cap) > 0
+  return (
+    <form
+      className="field flex flex-col gap-2 p-3 text-sm"
+      onSubmit={(e) => {
+        e.preventDefault()
+        if (ok) onCreate({ type: 'createGroup', title: title.trim(), contactIds: ids, leadContactId: lead, hourlyCapUsd: Number(cap) })
+      }}
+    >
+      <input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="#group name" aria-label="Group name" maxLength={40} className="field px-2 py-1" />
+      <fieldset className="flex flex-col gap-1">
+        <legend className="font-bold">Members</legend>
+        {contacts.map((c) => (
+          <label key={c.id} className="flex items-center gap-2">
+            <input type="checkbox" checked={ids.includes(c.id)} onChange={(e) => setIds(e.target.checked ? [...ids, c.id] : ids.filter((i) => i !== c.id))} />
+            {c.displayName}
+          </label>
+        ))}
+      </fieldset>
+      <label className="flex flex-col gap-1 font-bold">
+        Lead (gets un-mentioned posts)
+        <select value={lead} onChange={(e) => setLead(e.target.value)} className="field px-2 py-1 font-normal">
+          {contacts.filter((c) => ids.includes(c.id)).map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.displayName}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="flex flex-col gap-1 font-bold">
+        Spend cap per hour (USD)
+        <input type="number" min="0.01" step="0.5" value={cap} onChange={(e) => setCap(e.target.value)} className="field px-2 py-1 font-normal" />
+      </label>
+      <div className="flex gap-2">
+        <button type="button" onClick={onCancel} className="btn flex-1 bg-panel py-1 text-ink">
+          Cancel
+        </button>
+        <button type="submit" disabled={!ok} className="btn flex-1 bg-me py-1 text-on-me">
+          Create
+        </button>
+      </div>
+    </form>
+  )
+}
+
+function GroupInfo({ t, members, statusOf }: { t: Thread; members: Contact[]; statusOf: (c: Contact) => 'Needs you' | 'Typing' | 'Idle' }) {
+  const spent = t.spentHourUsd ?? 0
+  return (
+    <aside className="panel hidden min-h-0 flex-col gap-4 overflow-y-auto p-5 lg:flex">
+      <div className="title-type text-2xl font-bold">Group info</div>
+      <ul className="flex flex-col gap-3">
+        {members.map((c) => {
+          const s = statusOf(c)
+          return (
+            <li key={c.id} className="flex items-center gap-3">
+              <Avatar c={c} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-bold">
+                  {c.displayName}
+                  {c.id === t.leadContactId && <span className="ml-1 text-xs font-normal text-muted">· lead</span>}
+                </div>
+                <div className="text-xs text-muted">{c.agentName}</div>
+              </div>
+              <span className={`b-tag rounded-full px-2 text-xs ${s === 'Needs you' ? 'bg-alert text-on-alert' : s === 'Typing' ? 'bg-ok text-on-accent' : ''}`}>{s}</span>
+            </li>
+          )
+        })}
+      </ul>
+      <div className="text-sm">
+        Pauses after <b>{HOP_LIMIT}</b> agent-to-agent hand-offs without you.
+      </div>
+      {t.hourlyCapUsd !== null && (
+        <div className="w-full text-sm">
+          <div className="mb-1 flex justify-between font-bold">
+            <span>Group spend this hour</span>
+            <span>
+              ${spent.toFixed(2)} / ${t.hourlyCapUsd.toFixed(2)}
+            </span>
+          </div>
+          <div className="field h-3 overflow-hidden">
+            <div className="h-full bg-ok" style={{ width: `${Math.min(100, (spent / t.hourlyCapUsd) * 100)}%` }} />
+          </div>
+        </div>
+      )}
+    </aside>
+  )
+}
+
+const TypingBubble = ({ c, showPfp }: { c: Contact; showPfp: boolean }) => (
+  <div className="flex items-end gap-2 self-start">
+    {showPfp && <Avatar c={c} size="size-7 text-[10px]" />}
+    <div className="bubble flex items-center gap-1 bg-them py-3 text-on-them" aria-label={`${c.displayName} is typing`}>
+      <span className="dot" />
+      <span className="dot" />
+      <span className="dot" />
+    </div>
+  </div>
+)
+
 export default function App() {
   const { state, emit } = useGcnb()
   const [themeId, setThemeId] = useTheme()
   const [threadId, setThreadId] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
   const scroller = useRef<HTMLDivElement>(null)
 
+  const byId = (id?: string | null) => state.contacts.find((c) => c.id === id)
+  const membersOf = (t: Thread) => t.contactIds.map(byId).filter((c): c is Contact => !!c)
   const thread = state.threads.find((t) => t.id === threadId) ?? state.threads[0]
-  const contactOf = (t: Thread) => state.contacts.find((c) => c.id === t.contactIds[0])
-  const contact = thread && contactOf(thread)
+  const isGroup = thread?.kind === 'group'
+  const members = thread ? membersOf(thread) : []
+  const contact = isGroup ? undefined : members[0] // the DM's contact
   const agent = contact && state.agents[contact.id]
-  const typing = !!contact && state.typing.includes(contact.id)
   const messages = state.messages.filter((m) => m.threadId === thread?.id)
   const lastUserId = messages.findLast((m) => m.sender === 'user')?.id
+
+  // Typing is per contact, tagged with the thread its turn belongs to.
+  const typingIn = (tid: string) => state.typing.filter((t) => t.threadId === tid).map((t) => t.contactId)
+  const typers = thread ? membersOf(thread).filter((c) => typingIn(thread.id).includes(c.id)) : []
   // "Needs you": an open approval/question card. Drives the unread dot, status pill and Y/N keys.
   const isOpenCard = (m: Message) => (m.kind === 'approval' || m.kind === 'question') && m.body.status === 'pending'
-  const needsYou = (contactId: string) => state.messages.some((m) => m.contactId === contactId && isOpenCard(m))
-  const waiting = !!contact && needsYou(contact.id)
+  const threadNeedsYou = (tid: string) => state.messages.some((m) => m.threadId === tid && isOpenCard(m))
+  const waiting = !!thread && threadNeedsYou(thread.id)
+  const statusOf = (c: Contact) =>
+    messages.some((m) => m.contactId === c.id && isOpenCard(m)) ? 'Needs you' : typers.includes(c) ? 'Typing' : 'Idle'
+  const busy = members.filter((c) => statusOf(c) !== 'Idle')
   const answer = (m: Message) => (a: Answer) => emit({ type: 'answer', actionId: m.body.actionId!, ...a })
 
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight })
-  }, [messages.length, typing, waiting])
+  }, [messages.length, typers.length, waiting])
 
   // Fitts's law: Y allows once, N denies the newest open approval card (not while typing in a field).
   const openApproval = messages.findLast((m) => m.kind === 'approval' && m.body.status === 'pending')
@@ -406,18 +568,56 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   })
 
-  const status = !state.connected ? 'Reconnecting…' : waiting ? 'Waiting on you' : typing ? 'Typing…' : agent?.live ? 'Online' : 'Offline'
+  const status = !state.connected
+    ? 'Reconnecting…'
+    : waiting
+      ? 'Waiting on you'
+      : typers.length
+        ? isGroup
+          ? `${typers.map((c) => c.displayName).join(', ')} typing…`
+          : 'Typing…'
+        : isGroup
+          ? 'Idle'
+          : agent?.live
+            ? 'Online'
+            : 'Offline'
+  const statusTone = waiting ? 'bg-accent text-on-accent' : !state.connected || (!isGroup && !agent?.live) ? 'bg-alert text-on-alert' : 'bg-ok text-on-accent'
+
+  const preview = (t: Thread) => {
+    if (threadNeedsYou(t.id)) return <b>Needs you</b>
+    const typing = membersOf(t).filter((c) => typingIn(t.id).includes(c.id))
+    if (typing.length) return <i>{t.kind === 'group' ? `${typing[0].displayName} is typing…` : 'typing…'}</i>
+    const last = state.messages.findLast((m) => m.threadId === t.id)
+    if (!last) return 'Say hi'
+    return t.kind === 'group' && last.sender === 'agent' ? `${byId(last.contactId)?.displayName}: ${last.body.text}` : last.body.text
+  }
 
   return (
     <div className="grid h-dvh grid-cols-1 gap-3 p-3 md:grid-cols-[260px_1fr] lg:grid-cols-[260px_1fr_280px]">
       <aside className="panel hidden min-h-0 flex-col gap-4 p-4 md:flex">
-        <div>
-          <div className="title-type text-3xl font-bold">gcnb</div>
-          <div className="text-xs text-muted">gc, no burger</div>
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="title-type text-3xl font-bold">gcnb</div>
+            <div className="text-xs text-muted">gc, no burger</div>
+          </div>
+          <button className="btn bg-accent px-2.5 py-1 text-sm text-on-accent" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+            + Group
+          </button>
         </div>
+        {creating && (
+          <NewGroup
+            contacts={state.contacts}
+            onCancel={() => setCreating(false)}
+            onCreate={(g) => {
+              emit(g)
+              setCreating(false)
+            }}
+          />
+        )}
         <nav className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto" aria-label="Chats">
           {state.threads.map((t) => {
-            const c = contactOf(t)
+            const ms = membersOf(t)
+            const c = t.kind === 'dm' ? ms[0] : undefined
             const last = state.messages.findLast((m) => m.threadId === t.id)
             const active = t.id === thread?.id
             return (
@@ -427,23 +627,19 @@ export default function App() {
                 aria-current={active}
                 className={`flex items-center gap-3 rounded-bubble p-2 text-left ${active ? 'btn bg-accent text-on-accent' : ''}`}
               >
-                {c && (
-                  <div className="relative">
-                    <Avatar c={c} />
-                    {needsYou(c.id) && <span className="absolute -right-0.5 -bottom-0.5 size-3.5 rounded-full bg-alert b-tag" aria-label="needs you" />}
-                  </div>
-                )}
+                <div className="relative">
+                  {c ? <Avatar c={c} /> : <Stack cs={ms} />}
+                  {threadNeedsYou(t.id) && <span className="absolute -right-0.5 -bottom-0.5 size-3.5 rounded-full bg-alert b-tag" aria-label="needs you" />}
+                </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex justify-between gap-2">
                     <span className="truncate font-bold">
-                      {c?.displayName ?? t.title}
-                      {c && <span className="ml-1.5 rounded-full px-1.5 text-[10px] font-normal opacity-70 b-tag">{c.agentName}</span>}
+                      {c ? c.displayName : `#${t.title}`}
+                      <span className="b-tag ml-1.5 rounded-full px-1.5 text-[10px] font-normal opacity-70">{c ? c.agentName : 'group'}</span>
                     </span>
                     <span className="shrink-0 text-xs opacity-70">{last && time(last.createdAt)}</span>
                   </div>
-                  <div className="truncate text-sm opacity-80">
-                    {c && needsYou(c.id) ? <b>Needs you</b> : c && state.typing.includes(c.id) ? <i>typing…</i> : (last?.body.text ?? 'Say hi')}
-                  </div>
+                  <div className="truncate text-sm opacity-80">{preview(t)}</div>
                 </div>
               </button>
             )
@@ -462,59 +658,72 @@ export default function App() {
       </aside>
 
       <main className="panel flex min-h-0 flex-col overflow-hidden">
-        {contact && thread ? (
+        {thread && members.length ? (
           <>
             <header className="rule-b flex items-center gap-3 p-4">
-              <Avatar c={contact} />
+              {contact ? <Avatar c={contact} /> : <Stack cs={members} size="size-9 text-xs" />}
               <div className="min-w-0 flex-1">
-                <div className="title-type text-xl font-bold">{contact.displayName}</div>
+                <div className="title-type truncate text-xl font-bold">{contact ? contact.displayName : `#${thread.title}`}</div>
                 <div className="truncate text-xs text-muted">
-                  working in <span className="font-mono">{contact.cwd}</span>
+                  {contact ? (
+                    <>
+                      working in <span className="font-mono">{contact.cwd}</span>
+                    </>
+                  ) : (
+                    `${members.map((c) => c.displayName).join(', ')} and you · lead: ${byId(thread.leadContactId)?.displayName ?? '—'}`
+                  )}
                 </div>
               </div>
-              <span
-                className={`btn px-3 py-1 text-xs ${waiting ? 'bg-accent text-on-accent' : agent?.live && state.connected ? 'bg-ok text-on-accent' : 'bg-alert text-on-alert'}`}
-              >
-                {status}
-              </span>
-              {contact.sessionId && <CopyButton text={resumeCommand(contact)} label="Open in terminal" className="hidden sm:block" />}
-              {(typing || waiting) && (
-                <button className="btn bg-alert px-3 py-1.5 text-sm text-on-alert" onClick={() => emit({ type: 'interrupt', contactId: contact.id })}>
-                  ■ Stop
+              <span className={`btn px-3 py-1 text-xs ${statusTone}`}>{status}</span>
+              {contact?.sessionId && <CopyButton text={resumeCommand(contact)} label="Open in terminal" className="hidden sm:block" />}
+              {busy.length > 0 && (
+                <button className="btn bg-alert px-3 py-1.5 text-sm text-on-alert" onClick={() => busy.forEach((c) => emit({ type: 'interrupt', contactId: c.id }))}>
+                  {isGroup ? '❚❚ Pause all' : '■ Stop'}
                 </button>
               )}
             </header>
             <div ref={scroller} className="wallpaper flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4" aria-live="polite">
-              {messages.map((m) =>
-                m.kind === 'tool' ? (
-                  <ToolLine key={m.id} m={m} />
-                ) : m.kind === 'approval' ? (
-                  <ApprovalCard key={m.id} m={m} onAnswer={answer(m)} />
-                ) : m.kind === 'question' ? (
-                  <QuestionCard key={m.id} m={m} onAnswer={answer(m)} />
-                ) : (
-                  <Bubble key={m.id} m={m} showReceipt={m.id === lastUserId} />
-                ),
-              )}
-              {typing && (
-                <div className="bubble flex items-center gap-1 self-start bg-them py-3 text-on-them" aria-label={`${contact.displayName} is typing`}>
-                  <span className="dot" />
-                  <span className="dot" />
-                  <span className="dot" />
-                </div>
-              )}
+              {messages.map((m) => {
+                const who = byId(m.contactId)
+                if (m.body.handoff) return <HandoffPill key={m.id} m={m} from={byId(m.body.handoff.from)} to={byId(m.body.handoff.to)} />
+                if (m.kind === 'tool') return <ToolLine key={m.id} m={m} c={isGroup ? who : undefined} />
+                if (m.kind === 'approval') return <ApprovalCard key={m.id} m={m} onAnswer={answer(m)} />
+                if (m.kind === 'question') return <QuestionCard key={m.id} m={m} onAnswer={answer(m)} />
+                // In a group, agent bubbles carry their pfp and name.
+                if (isGroup && m.sender === 'agent' && who)
+                  return (
+                    <div key={m.id} className="flex max-w-[85%] items-end gap-2 self-start">
+                      <Avatar c={who} size="size-7 text-[10px]" />
+                      <div className="flex min-w-0 flex-col">
+                        <div className="mb-1 text-xs font-bold">
+                          {who.displayName} <span className="font-normal text-muted">· {who.agentName}</span>
+                        </div>
+                        <Bubble m={m} showReceipt={false} />
+                      </div>
+                    </div>
+                  )
+                return <Bubble key={m.id} m={m} showReceipt={m.id === lastUserId} />
+              })}
+              {typers.map((c) => (
+                <TypingBubble key={c.id} c={c} showPfp={isGroup} />
+              ))}
             </div>
             {agent && !agent.live && <div className="bg-alert px-4 py-2 text-sm font-bold text-on-alert">{agent.reason}</div>}
-            <Composer name={contact.displayName} disabled={!state.connected} onSend={(text) => emit({ type: 'send', threadId: thread.id, text })} />
+            <Composer
+              name={contact ? contact.displayName : `#${thread.title}`}
+              mentions={isGroup ? members.map((c) => c.displayName) : undefined}
+              disabled={!state.connected}
+              onSend={(text) => emit({ type: 'send', threadId: thread.id, text })}
+            />
           </>
         ) : (
           <div className="grid flex-1 place-items-center text-muted">{state.connected ? 'No chats yet' : 'Connecting to gcnb server…'}</div>
         )}
       </main>
 
-      {contact && (
-        <ContactCard key={contact.id} c={contact} onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })} />
-      )}
+      {thread && isGroup && <GroupInfo t={thread} members={members} statusOf={statusOf} />}
+      {contact && <ContactCard key={contact.id} c={contact} onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })} />}
     </div>
   )
 }
+

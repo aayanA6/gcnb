@@ -1,13 +1,30 @@
 // All Claude Agent SDK handling lives in this module (plan: "SDK and preview churn" risk).
-import { query, type CanUseTool, type PermissionMode, type PermissionResult, type PermissionUpdate, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
+import {
+  createSdkMcpServer,
+  query,
+  tool,
+  type CanUseTool,
+  type PermissionMode,
+  type PermissionResult,
+  type PermissionUpdate,
+  type Query,
+  type SDKUserMessage,
+} from '@anthropic-ai/claude-agent-sdk'
 import type { AgentState, Decision, Message, Question, ServerEvent } from '@gcnb/shared'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, relative } from 'node:path'
+import { z } from 'zod'
 import type { Db } from '../db.ts'
 import type { AgentFile } from '../agents.ts'
+import type { Delivery } from '../router.ts'
 
-const PERSONA =
-  'You are chatting with the user through gcnb, an iMessage-style app. Reply like a text message: short, plain, conversational. Use markdown only when sharing code.'
+const PERSONA = [
+  'You are chatting with the user through gcnb, an iMessage-style app. Reply like a text message: short, plain, conversational. Use markdown only when sharing code.',
+  'Group chat messages arrive prefixed like "[#group · from Name · members: a, b]". Your final reply in that turn posts to the group.',
+  'To pass work to another member of that group, call the hand_off tool with their name and a self-contained message; the server delivers it and their reply posts to the group. Only hand off when someone else should act next.',
+].join('\n')
+
+export const HAND_OFF = 'mcp__gcnb__hand_off'
 
 // Close a contact's process after this long without a turn; the next message resumes the session.
 const IDLE_MS = Number(process.env.GCNB_IDLE_MIN ?? 30) * 60_000
@@ -87,6 +104,14 @@ function describeRequest(name: string, input: Record<string, unknown>, cwd: stri
 
 type Pending = { resolve: (r: PermissionResult) => void; messageId: string; input: Record<string, unknown>; suggestions?: PermissionUpdate[] }
 
+export type RuntimeHooks = {
+  /** hand_off tool: route work to another member; returns the tool result text. */
+  handOff(fromId: string, from: Delivery, to: string, message: string): string
+  /** A group turn finished and cost this much (for the group's hourly cap). */
+  groupTurnCost(threadId: string, usd: number): void
+  isGroup(threadId: string): boolean
+}
+
 /** One long-lived SDK session for one contact. Started on the first message, resumed by session_id. */
 export class AgentRuntime {
   private q?: Query
@@ -94,20 +119,27 @@ export class AgentRuntime {
   private idleTimer?: NodeJS.Timeout
   private restartAfterTurn = false
   private interrupted = false
-  private outstanding = 0 // user messages sent that haven't produced a result yet
+  // One active turn per contact: deliveries wait here until the current turn's result.
+  private queue: Delivery[] = []
+  private current?: Delivery & { startSpent: number }
   private pending = new Map<string, Pending>() // open canUseTool promises by action id
   typing = false
 
   constructor(
     private db: Db,
     readonly contactId: string,
-    private threadId: string,
     private agent: AgentFile,
     private emit: (e: ServerEvent) => void,
+    private hooks: RuntimeHooks,
   ) {}
 
   get running() {
     return !!this.q
+  }
+
+  /** The thread this contact's current turn belongs to (its DM when idle). */
+  get threadId() {
+    return this.current?.threadId ?? `dm-${this.contactId}`
   }
 
   private get contact() {
@@ -123,17 +155,27 @@ export class AgentRuntime {
     return { contactId: c.id, live: true }
   }
 
-  /** Queues a user message into the session. Caller checks state().live first. */
-  send(text: string) {
-    clearTimeout(this.idleTimer)
-    if (!this.q) this.start()
-    this.outstanding++
-    this.box!.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null } as SDKUserMessage)
+  /** Queue a message for this contact's session. Caller checks state().live first. */
+  deliver(d: Delivery) {
+    this.queue.push(d)
+    this.pump()
   }
 
-  /** Stop button: Query.interrupt() ends the current turn; open cards are cancelled. */
+  private pump() {
+    if (this.current || !this.queue.length) return
+    const d = this.queue.shift()!
+    clearTimeout(this.idleTimer)
+    if (!this.q) this.start()
+    this.current = { ...d, startSpent: this.contact.spentUsd }
+    this.box!.push({ type: 'user', message: { role: 'user', content: d.text }, parent_tool_use_id: null } as SDKUserMessage)
+  }
+
+  /** Stop button: Query.interrupt() ends the current turn, open cards are cancelled, queued messages dropped. */
   async interrupt() {
-    if (!this.q || !this.outstanding) return
+    const dropped = this.queue.length
+    this.queue = []
+    if (dropped) this.post('system', 'status', `Dropped ${dropped} queued message${dropped > 1 ? 's' : ''}`)
+    if (!this.q || !this.current) return
     this.interrupted = true
     for (const id of [...this.pending.keys()]) this.settle(id, 'cancelled', { behavior: 'deny', message: 'The user stopped this turn.', interrupt: true })
     await this.q.interrupt().catch(() => {})
@@ -147,13 +189,20 @@ export class AgentRuntime {
     // Detach now so a message arriving mid-shutdown starts a fresh process instead of a dead queue.
     this.q = undefined
     this.box = undefined
-    this.outstanding = 0
     this.setTyping(false)
+    this.current = undefined
+    this.pump() // anything still queued starts a fresh process
+  }
+
+  /** Server stop: drop the queue first so close() doesn't start anything new. */
+  shutdown() {
+    this.queue = []
+    this.close()
   }
 
   /** SDK options are fixed per process: close now (or after the current turn) and resume with new options on the next message. */
   restart() {
-    if (this.outstanding) this.restartAfterTurn = true
+    if (this.current) this.restartAfterTurn = true
     else this.close()
   }
 
@@ -225,12 +274,30 @@ export class AgentRuntime {
   private setTyping(on: boolean) {
     if (this.typing === on) return
     this.typing = on
-    this.emit({ type: 'typing', contactId: this.contactId, on })
+    this.emit({ type: 'typing', contactId: this.contactId, threadId: this.threadId, on })
   }
 
   private start() {
     const c = this.contact
     const box = inbox<SDKUserMessage>()
+    // In-process MCP server: agents talk to each other only through gcnb (plan: custom tools).
+    const gcnb = createSdkMcpServer({
+      name: 'gcnb',
+      version: '1.0.0',
+      tools: [
+        tool(
+          'hand_off',
+          'Pass work to another member of the current group chat. The server delivers your message into their session and their reply posts to the group. Chains pause after a few hand-offs without the user.',
+          {
+            to: z.string().describe('Name of the group member to hand off to, e.g. "coder"'),
+            message: z.string().describe('Self-contained instructions for them: what to do and the context they need'),
+          },
+          async ({ to, message }) => ({
+            content: [{ type: 'text' as const, text: this.current ? this.hooks.handOff(this.contactId, this.current, to, message) : 'No active turn.' }],
+          }),
+        ),
+      ],
+    })
     const q = query({
       prompt: box,
       options: {
@@ -241,9 +308,17 @@ export class AgentRuntime {
         allowDangerouslySkipPermissions: c.permissionMode === 'bypassPermissions',
         includePartialMessages: true,
         maxBudgetUsd: Math.max(0, c.budgetUsd - c.spentUsd),
-        disallowedTools: ['SendMessage', 'ListAgents'], // agents talk only through gcnb
+        disallowedTools: ['SendMessage', 'ListAgents'], // agents talk only through gcnb, where you can see it
+        mcpServers: { gcnb },
+        allowedTools: [HAND_OFF], // routing is gcnb's own tool; never needs an approval card
         // Run the session as the contact's own .claude/agents definition.
-        agents: { [this.agent.name]: { description: this.agent.description, prompt: `${this.agent.prompt}\n\n${PERSONA}`, tools: this.agent.tools } },
+        agents: {
+          [this.agent.name]: {
+            description: this.agent.description,
+            prompt: `${this.agent.prompt}\n\n${PERSONA}`,
+            tools: this.agent.tools && [...this.agent.tools, HAND_OFF],
+          },
+        },
         agent: this.agent.name,
         canUseTool: this.canUseTool,
       },
@@ -261,37 +336,45 @@ export class AgentRuntime {
           this.db.updateContact(this.contactId, { sessionId: m.session_id })
           this.emit({ type: 'contact', contact: this.contact })
         }
+        const group = this.hooks.isGroup(this.threadId)
         switch (m.type) {
           case 'stream_event':
             if (!m.parent_tool_use_id && !this.pending.size) this.setTyping(true)
             break
           case 'assistant': {
-            if (m.parent_tool_use_id) break // subagent chatter stays out of the DM
+            if (m.parent_tool_use_id) break // subagent chatter stays out of the chat
             for (const b of m.message.content) {
-              if (b.type === 'text' && b.text.trim()) this.post('agent', 'text', b.text.trim())
-              // AskUserQuestion gets a card instead of a grey line.
-              if (b.type === 'tool_use' && b.name !== 'AskUserQuestion')
+              // In a DM every text block is a bubble; in a group only the turn's final text posts (at result).
+              if (b.type === 'text' && b.text.trim() && !group) this.post('agent', 'text', b.text.trim())
+              // AskUserQuestion gets a card and hand_off gets a pill instead of a grey line.
+              if (b.type === 'tool_use' && b.name !== 'AskUserQuestion' && b.name !== HAND_OFF)
                 this.post('agent', 'tool', describeTool(b.name, b.input as Record<string, unknown>, this.contact.cwd), { toolName: b.name })
             }
             break
           }
           case 'result': {
-            this.outstanding = Math.max(0, this.outstanding - 1)
-            if (!this.outstanding) this.setTyping(false)
             const s = spendAfterResult(base, m.total_cost_usd, lifetime)
             lifetime = s.lifetime
             this.db.updateContact(this.contactId, { spentUsd: s.spent })
             this.emit({ type: 'contact', contact: this.contact })
+            const cost = this.current ? Math.max(0, s.spent - this.current.startSpent) : 0
+            if (group && m.subtype === 'success' && !m.is_error && m.result.trim()) this.post('agent', 'text', m.result.trim(), { costUsd: cost })
+            if (group) this.hooks.groupTurnCost(this.threadId, cost)
             if (this.interrupted) this.post('system', 'status', 'Stopped')
             else if (m.subtype === 'error_max_budget_usd') this.post('system', 'status', 'Paused: budget used up')
             else if (m.subtype !== 'success') this.post('system', 'status', `Turn stopped (${m.subtype})`)
             else if (m.is_error) this.post('system', 'status', `Error: ${m.result}`)
             this.interrupted = false
+            this.setTyping(false)
+            this.current = undefined
             this.emit({ type: 'agent', agent: this.state() })
-            if (this.outstanding) break
             if (this.restartAfterTurn) {
               this.restartAfterTurn = false
-              this.close()
+              this.close() // also pumps the queue into a fresh process
+            } else if (this.queue.length) {
+              // Budget may have run out while these waited.
+              if (this.state().live) this.pump()
+              else this.dropQueue(this.state().reason ?? 'offline')
             } else {
               this.idleTimer = setTimeout(() => this.close(), IDLE_MS)
             }
@@ -303,7 +386,15 @@ export class AgentRuntime {
       // A process we closed on purpose (idle, restart) has already been detached; stay quiet about it.
       if (this.q === q) this.post('system', 'status', `Agent error: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
-      if (this.q === q) this.close()
+      if (this.q === q) {
+        this.queue = []
+        this.close()
+      }
     }
+  }
+
+  private dropQueue(reason: string) {
+    for (const d of this.queue.splice(0))
+      this.emit({ type: 'message', message: this.db.addMessage({ threadId: d.threadId, sender: 'system', contactId: this.contactId, kind: 'status', body: { text: `${this.contact.displayName}: not delivered (${reason})` } }) })
   }
 }

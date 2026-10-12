@@ -1,6 +1,7 @@
 // Phase 2 "done when", storage half: three contacts keep separate sessions and history across a restart.
 // Run: pnpm test
 import assert from 'node:assert/strict'
+import Database from 'better-sqlite3'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,6 +9,7 @@ import { openDb } from './db.ts'
 import { parseAgentFile, withModel } from './agents.ts'
 import { AgentRuntime, describeTool, spendAfterResult } from './runtime/agent.ts'
 import type { CanUseTool } from '@anthropic-ai/claude-agent-sdk'
+import { Router, type Deliverable, type Delivery } from './router.ts'
 
 const dir = mkdtempSync(join(tmpdir(), 'gcnb-'))
 const file = join(dir, 'test.db')
@@ -62,7 +64,8 @@ assert.deepEqual(spendAfterResult(0.5, 0.9, false), { spent: 1.4, lifetime: fals
   const dir2 = mkdtempSync(join(tmpdir(), 'gcnb-'))
   const db2 = openDb(join(dir2, 'cards.db'))
   db2.seedContact({ ...seed('reviewer'), cwd: dir2, permissionMode: 'default' }, 'dm-reviewer')
-  const rt = new AgentRuntime(db2, 'reviewer', 'dm-reviewer', { name: 'reviewer', description: '', prompt: '', path: '' }, () => {})
+  const noHooks = { handOff: () => '', groupTurnCost: () => {}, isGroup: () => false }
+  const rt = new AgentRuntime(db2, 'reviewer', { name: 'reviewer', description: '', prompt: '', path: '' }, () => {}, noHooks)
   const canUseTool = (rt as unknown as { canUseTool: CanUseTool }).canUseTool
   const opts = (signal = new AbortController().signal) => ({ signal, toolUseID: 't', requestId: 'r', suggestions: [{ type: 'addRules' as const, rules: [{ toolName: 'Bash', ruleContent: 'pnpm test' }], behavior: 'allow' as const, destination: 'session' as const }] })
   const lastCard = () => db2.recentMessages('dm-reviewer').at(-1)!
@@ -107,6 +110,79 @@ assert.deepEqual(spendAfterResult(0.5, 0.9, false), { spent: 1.4, lifetime: fals
   assert.equal(lastCard().body.status, 'cancelled')
   db2.close()
   rmSync(dir2, { recursive: true, force: true })
+}
+
+// Phase 4 "done when", minus the live model: the server routes group posts and hand-offs, and a
+// forced loop pauses after HOP_LIMIT (4) agent-to-agent hops.
+{
+  const dir3 = mkdtempSync(join(tmpdir(), 'gcnb-'))
+  const db3 = openDb(join(dir3, 'group.db'))
+  for (const id of names) db3.seedContact({ ...seed(id), displayName: id[0].toUpperCase() + id.slice(1) }, `dm-${id}`)
+  const g = db3.createGroup({ title: 'launch crew', contactIds: names, leadContactId: 'planner', hourlyCapUsd: 1 })
+  assert.deepEqual([g.kind, g.leadContactId, g.contactIds], ['group', 'planner', names])
+
+  const got: Record<string, Delivery[]> = { planner: [], coder: [], reviewer: [] }
+  const fakes = new Map<string, Deliverable>(names.map((id) => [id, { state: () => ({ live: true }), deliver: (d: Delivery) => got[id].push(d) }]))
+  const router = new Router(db3, fakes, () => {}, 'Aayan')
+  const last = (id: string) => got[id].at(-1)!
+  const lines = () => db3.recentMessages(g.id).map((m) => m.body.text)
+
+  // No mention -> the lead; delivery is a prefixed user message into that member's own session.
+  router.post(g.id, 'plan the websocket hub')
+  assert.equal(last('planner').text, '[#launch crew · from Aayan · members: planner, coder, reviewer] plan the websocket hub')
+  assert.equal(last('planner').hops, 0)
+  assert.equal(db3.recentMessages(g.id).at(-1)!.body.delivered, true)
+  // @mentions by agent or display name, any case; @everyone hits all.
+  assert.deepEqual(router.recipients(g, '@coder and @Reviewer please look'), ['coder', 'reviewer'])
+  assert.deepEqual(router.recipients(g, '@everyone standup'), names)
+  assert.deepEqual(router.recipients(g, 'email me@coder.dev'), ['planner']) // an email address isn't a mention
+
+  // planner -> coder -> reviewer -> planner reports back
+  assert.match(router.handOff('planner', last('planner'), 'coder', 'build it'), /Handed off to Coder \(hand-off 1 of 4\)/)
+  assert.equal(last('coder').hops, 1)
+  assert.match(last('coder').text, /from Planner .*\] build it$/)
+  router.handOff('coder', last('coder'), '@reviewer', 'review it')
+  router.handOff('reviewer', last('reviewer'), 'Planner', 'looks good, one gap')
+  assert.equal(last('planner').hops, 3)
+  assert.ok(lines().includes('Planner handed off to Coder') && lines().includes('Reviewer handed off to Planner'))
+
+  // Forced loop: hop 4 still goes through, hop 5 pauses for the user.
+  router.handOff('planner', last('planner'), 'coder', 'again')
+  assert.equal(last('coder').hops, 4)
+  const before = got.reviewer.length
+  assert.match(router.handOff('coder', last('coder'), 'reviewer', 'and again'), /^Paused: 4 hand-offs/)
+  assert.equal(got.reviewer.length, before) // not delivered
+  assert.equal(lines().at(-1), 'Paused after 4 hand-offs, waiting for you')
+  // A user post restarts the count.
+  router.post(g.id, '@coder keep going')
+  assert.equal(last('coder').hops, 0)
+
+  // Bad targets
+  assert.match(router.handOff('coder', last('coder'), 'coder', 'me'), /No other member/)
+  assert.match(router.handOff('coder', last('coder'), 'ghost', 'x'), /No other member called "ghost"/)
+  assert.match(router.handOff('coder', { threadId: 'dm-coder', text: '', hops: 0 }, 'reviewer', 'x'), /only works inside a group/)
+
+  // Group hourly spend cap on top of each contact's cap.
+  router.recordSpend(g.id, 1.25)
+  assert.equal(router.withSpend(db3.thread(g.id)!).spentHourUsd, 1.25)
+  const n = got.planner.length
+  router.post(g.id, 'one more thing')
+  assert.equal(got.planner.length, n)
+  assert.equal(lines().at(-1), 'Paused: #launch crew hit its $1.00/hour spend cap')
+  db3.close()
+  rmSync(dir3, { recursive: true, force: true })
+}
+
+// Migration: a Phase 1-3 database (threads without the group columns) opens and gains them.
+{
+  const dir4 = mkdtempSync(join(tmpdir(), 'gcnb-'))
+  const raw = new Database(join(dir4, 'old.db'))
+  raw.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL); INSERT INTO threads VALUES ('dm-x', 'dm', 'X', 1)")
+  raw.close()
+  const migrated = openDb(join(dir4, 'old.db'))
+  assert.deepEqual(migrated.threads().map((t) => [t.id, t.leadContactId, t.hourlyCapUsd]), [['dm-x', null, null]])
+  migrated.close()
+  rmSync(dir4, { recursive: true, force: true })
 }
 
 // Grey tool lines

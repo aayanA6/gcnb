@@ -70,6 +70,20 @@ pnpm typecheck
 
 Every `.claude/agents/*.md` file becomes a contact: the frontmatter supplies `name`, `description`, `model` and `tools`, and the body is the agent's instructions. The repo ships a planner, coder and reviewer. Pfps, display names, colors, folders and budgets live in gcnb's database. You edit them from the contact card on the right; click the pfp to upload a new one.
 
+## Group chat
+
+The server routes group chats; no model decides who gets a message:
+- Posting in a group sends your message to each **@mentioned** member, or to the group's lead if you mention no one.
+- Each agent gets it in its own session, prefixed with the group and sender, and its final reply posts to the group.
+- Agents pass work along with a `hand_off(to, message)` tool. A chain pauses after **4** hand-offs without you, each contact runs one turn at a time, and every group has an hourly spend cap.
+
+The repo starts you with **#launch crew** (planner as lead, coder, reviewer). Create more with **+ Group**.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GCNB_USER_NAME` | `You` | Your name in group message prefixes |
+| `GCNB_GROUP_HOURLY_CAP_USD` | `5` | Default hourly spend cap for new groups |
+
 ## See and steer
 
 - Grey lines between bubbles show what the agent is doing ("Read src/auth.ts", "Ran npm test").

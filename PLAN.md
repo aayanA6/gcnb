@@ -8,8 +8,8 @@ Source of truth: *gcnb — execution plan* (Sep 30, 2026). Each phase ends in so
 | **1. One DM, end to end** | Repo scaffold, one hardcoded contact, WebSocket events, bubbles, typing indicator, SQLite history | You chat in the browser, restart the server, and both the chat and the agent's memory survive | ✅ Done (see notes) |
 | **2. Contacts** | Load `.claude/agents`, contact list, pfp upload with an initials fallback, per-contact model, folder and budget, idle close (~30 min) and resume | Three contacts with separate sessions, all surviving a restart | ✅ Done (see notes) |
 | **3. See and steer** | Grey tool lines, approval cards with tapbacks, question chips, stop button (`Query.interrupt()`), spend on the contact card, "Open in terminal" | An agent asks to run a shell command and you approve it with a tapback | ✅ Built (see notes) |
-| **4. Group chat** | Threads and members, routing, `hand_off` tool (in-process MCP via `createSdkMcpServer()`), loop guards (4 hops, one turn per contact, group spend cap per hour) | Planner hands to coder, coder to reviewer, reviewer reports back; a forced loop pauses at 4 hops | Next |
-| **5. iMessage everywhere** | Light and dark themes, full visual polish from the UI templates, browser notifications, `tailscale serve`, installable PWA, voice (local Whisper), package as a Claude Code plugin (`/gcnb`) | Your phone buzzes when an agent needs you and you approve from the phone | |
+| **4. Group chat** | Threads and members, routing, `hand_off` tool (in-process MCP via `createSdkMcpServer()`), loop guards (4 hops, one turn per contact, group spend cap per hour) | Planner hands to coder, coder to reviewer, reviewer reports back; a forced loop pauses at 4 hops | ✅ Built (see notes) |
+| **5. iMessage everywhere** | Light and dark themes, full visual polish from the UI templates, browser notifications, `tailscale serve`, installable PWA, voice (local Whisper), package as a Claude Code plugin (`/gcnb`) | Your phone buzzes when an agent needs you and you approve from the phone | Next |
 | **6. Stretch** | Agents that text first on a schedule, import an existing CLI session as a contact, agent view bridge experiment, Tauri window | Pick based on what you actually miss after using Phase 5 | |
 
 ## Phase 1 notes
@@ -80,6 +80,50 @@ Verified:
 - **Not yet exercised live:** a real agent requesting `Bash` and you tapping 👍. That needs `ANTHROPIC_API_KEY`. To try it: DM the reviewer "run the tests", tap 👍 or press Y.
 
 Not done yet: "Always allow" rules last only for that session (`destination` comes from the SDK's suggestion). Persisting them to `.claude/settings.local.json` is left for the contact-settings work.
+
+## Phase 4 notes
+
+What shipped:
+- **Groups:** `threads` gained `lead_contact_id` and `hourly_cap_usd`. Older databases are migrated in place on open. Members live in `thread_members`.
+  - Create a group from **+ Group** (name, members, lead, hourly cap).
+  - A starter **#launch crew** (planner as lead, coder, reviewer; $5/hour) is created on first run if no group exists.
+- **Server-side routing** (`apps/server/src/router.ts`, no model involved):
+  - A post goes to each `@mentioned` member (agent or display name, any case; `@everyone` = all). With no mention it goes to the group's lead. Email addresses don't count as mentions.
+  - Delivery is a user message into the member's **own** session, prefixed `[#launch crew · from Aayan · members: planner, coder, reviewer]` (`GCNB_USER_NAME` sets your name). Each agent keeps its own context.
+  - When an agent's group turn ends, its final text (`result`) posts to the group as its bubble. In DMs every text block still posts as before.
+- **`hand_off(to, message)`:**
+  - An in-process MCP tool built with `createSdkMcpServer()` + `tool()`, exposed as `mcp__gcnb__hand_off`.
+  - It's in `allowedTools`, so it never raises an approval card, and it's appended to agents that restrict `tools:`.
+  - The router delivers the message into the target's session and posts a hand-off pill (pfp → pfp, "Planner handed off to Coder"). The calling agent gets a tool result like "Handed off to Coder (hand-off 1 of 4)".
+- **Guards:**
+  - **Hop limit:** each delivery carries a hop count. A user post resets it to 0, and each hand-off adds 1. Hop 5 is refused, the group gets "Paused after 4 hand-offs, waiting for you", and the agent is told to stop handing off.
+  - **One active turn per contact:** each runtime keeps its own delivery queue and only feeds the SDK the next message after the current turn's `result`. So a reply is always tied to the thread it came from, and nothing gets folded into another group's turn.
+  - **Group hourly spend cap** on top of each contact's `maxBudgetUsd`: each group turn's cost is recorded, and deliveries stop with "Paused: #group hit its $X/hour spend cap" once the last hour's spend reaches the cap.
+  - **`disallowedTools: ['SendMessage', 'ListAgents']`** in every gcnb session, so agents can only talk through gcnb.
+- **"What is everyone doing":**
+  - Every member's grey tool lines, typing dots and cards land in the group they're working for, tagged with their pfp and name.
+  - The group panel lists members with Needs you / Typing / Idle, the lead, the hop limit and the hourly spend.
+  - **Pause all** interrupts every busy member and drops their queues.
+  - Mention chips (@Planner, @Coder, @Reviewer, @everyone) sit above the composer.
+
+Verified:
+- `pnpm test` covers routing with fake runtimes:
+  - an unmentioned post goes to the lead with the right prefix; mentions and `@everyone` work, emails don't count;
+  - the **planner → coder → reviewer → planner** chain, with pills and hop counts 1-2-3;
+  - a **forced loop** delivers hop 4 and pauses on hop 5;
+  - a user post resets the count;
+  - unknown, self and DM hand-offs are refused, and the hourly cap blocks deliveries;
+  - an old-schema database migrates.
+- A bounded WebSocket smoke test against the real server:
+  - the starter group is created with lead and cap;
+  - an @mention post routes to coder and reviewer (each shows "not delivered" without an API key);
+  - `createGroup` works, and a one-member group is rejected.
+- **Not yet exercised live:** real agents choosing to call `hand_off`. That needs `ANTHROPIC_API_KEY`. To try it, post in #launch crew: "Plan a tiny change, hand it to coder to make it, then coder hands to reviewer, and reviewer reports back."
+
+Not done yet:
+- The hourly group spend is kept in memory, so a restart forgets the last hour.
+- The hop limit is the global `HOP_LIMIT = 4`, not a per-group setting.
+- Typing indicators are per contact, so a member busy in a DM won't show as typing in a group.
 
 ## Decisions
 

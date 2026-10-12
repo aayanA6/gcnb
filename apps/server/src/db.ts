@@ -25,6 +25,8 @@ export const threads = sqliteTable('threads', {
   kind: text('kind', { enum: ['dm', 'group'] }).notNull(),
   title: text('title').notNull(),
   createdAt: integer('created_at').notNull(),
+  leadContactId: text('lead_contact_id'),
+  hourlyCapUsd: real('hourly_cap_usd'),
 })
 
 export const threadMembers = sqliteTable(
@@ -63,7 +65,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('dm','group')), title TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL, lead_contact_id TEXT, hourly_cap_usd REAL
 );
 CREATE TABLE IF NOT EXISTS thread_members (
   thread_id TEXT NOT NULL REFERENCES threads(id), contact_id TEXT NOT NULL REFERENCES contacts(id),
@@ -88,6 +90,10 @@ export function openDb(file: string) {
   sqlite.pragma('journal_mode = WAL')
   sqlite.pragma('foreign_keys = ON')
   sqlite.exec(DDL)
+  // Phase 4 added group columns; bring older databases up to date.
+  const threadCols = (sqlite.prepare('PRAGMA table_info(threads)').all() as { name: string }[]).map((c) => c.name)
+  if (!threadCols.includes('lead_contact_id')) sqlite.exec('ALTER TABLE threads ADD COLUMN lead_contact_id TEXT')
+  if (!threadCols.includes('hourly_cap_usd')) sqlite.exec('ALTER TABLE threads ADD COLUMN hourly_cap_usd REAL')
   const db = drizzle(sqlite)
 
   const toMessage = (r: typeof messages.$inferSelect): Message => ({
@@ -123,6 +129,17 @@ export function openDb(file: string) {
         ...t,
         contactIds: members.filter((m) => m.threadId === t.id).map((m) => m.contactId),
       }))
+    },
+    thread(id: string): Thread | undefined {
+      return this.threads().find((t) => t.id === id)
+    },
+    createGroup(g: { title: string; contactIds: string[]; leadContactId: string; hourlyCapUsd: number }): Thread {
+      const id = `g-${randomUUID()}`
+      db.transaction((tx) => {
+        tx.insert(threads).values({ id, kind: 'group', title: g.title, createdAt: Date.now(), leadContactId: g.leadContactId, hourlyCapUsd: g.hourlyCapUsd }).run()
+        for (const contactId of g.contactIds) tx.insert(threadMembers).values({ threadId: id, contactId }).run()
+      })
+      return this.thread(id)!
     },
     threadContactIds: (threadId: string) =>
       db.select().from(threadMembers).where(eq(threadMembers.threadId, threadId)).all().map((m) => m.contactId),
