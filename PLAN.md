@@ -141,7 +141,9 @@ Verified:
 - `pnpm --filter @gcnb/server typecheck`.
 - `pnpm build:plugin` produces `dist/web/index.html` and `dist/server/index.mjs`; `node --check dist/server/index.mjs` passes.
 - A bounded smoke test of `bin/gcnb` against a temp `${CLAUDE_PLUGIN_DATA}` (node_modules pointed at the repo's own, since `install-deps` wasn't exercised): `up` copies the bundle, starts the server and waits for `/api/health`; a second `up` recognizes it's already running; `stop` kills it and clears the PID file; `status` reports correctly before, during and after, and nothing was left running.
-- Not run here: the web app's own typecheck/build (themes, phone layout, search/filters, PWA and push UI were mid-edit at the same time), and `gcnb install-deps`'s actual `npm install` into `${CLAUDE_PLUGIN_DATA}`.
+- `pnpm -r typecheck` and the web build.
+- A bounded smoke test of the real server (tester pass): it serves the built page, `sw.js` and the manifest with the right types; `/../` and `/%2e%2e/` traversal fall back to `index.html` without leaking files; `/api/nope` is a JSON 404; `/api/config` returns the VAPID key; a foreign-origin POST to `/api/push/subscribe` gets 403, while a bad body or an `http://` endpoint gets 400; `/api/transcribe` without Whisper gets 404. On the WebSocket, a foreign origin is refused, same-origin is accepted, and a `*.ts.net` origin is accepted only when `X-Forwarded-Host` matches (as `tailscale serve` sends it).
+- **Not yet exercised live:** a real phone buzzing over `tailscale serve`, and `gcnb install-deps`'s `npm install` into `${CLAUDE_PLUGIN_DATA}`. To try the phone: `pnpm --filter @gcnb/web build`, start the server, `tailscale serve --bg 8787`, open the `*.ts.net` URL on your phone, Add to Home Screen, tap **Turn on pings**, lock the phone, then DM the reviewer "run the tests".
 
 Not done yet:
 - `app_settings` table: theme and other prefs still live in `localStorage`, not SQLite.
