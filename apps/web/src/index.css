@@ -46,6 +46,7 @@ body {
   letter-spacing: var(--fonts-display-tracking);
 }
 .wallpaper { background: var(--wallpaper); }
+.b-tag { border: 1px solid currentColor; }
 .bubble {
   border: var(--borders-bubble);
   border-radius: var(--radii-bubble);

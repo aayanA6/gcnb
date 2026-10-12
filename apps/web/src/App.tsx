@@ -59,9 +59,8 @@ function useGcnb() {
       ws.current?.close()
     }
   }, [])
-  const send = (threadId: string, text: string) =>
-    ws.current?.send(JSON.stringify({ type: 'send', threadId, text } satisfies ClientEvent))
-  return { state, send }
+  const emit = (ev: ClientEvent) => ws.current?.send(JSON.stringify(ev))
+  return { state, emit }
 }
 
 function useTheme() {
@@ -84,6 +83,7 @@ function useTheme() {
 const time = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 
 function Avatar({ c, size = 'size-10' }: { c: Contact; size?: string }) {
+  if (c.avatarPath) return <img src={c.avatarPath} alt="" className={`${size} btn shrink-0 rounded-full object-cover`} />
   const initials = c.displayName.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase()
   return (
     <div aria-hidden className={`${size} btn grid shrink-0 place-items-center rounded-full font-bold text-[#1d1b2e]`} style={{ background: c.color }}>
@@ -141,8 +141,99 @@ function Composer({ name, disabled, onSend }: { name: string; disabled: boolean;
   )
 }
 
+const MODELS = ['sonnet', 'opus', 'haiku']
+type ContactPatch = { displayName?: string; model?: string; cwd?: string; budgetUsd?: number }
+
+// Plan's contact card: pfp, bio, the three common edits on top, engine settings below.
+function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) => void }) {
+  const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, budget: String(c.budgetUsd) })
+  const [error, setError] = useState('')
+  const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm({ ...form, [k]: e.target.value })
+
+  const budget = Number(form.budget)
+  const patch: ContactPatch = {}
+  if (form.displayName.trim() && form.displayName.trim() !== c.displayName) patch.displayName = form.displayName.trim()
+  if (form.model !== c.model) patch.model = form.model
+  if (form.cwd.trim() && form.cwd.trim() !== c.cwd) patch.cwd = form.cwd.trim()
+  if (budget > 0 && budget !== c.budgetUsd) patch.budgetUsd = budget
+  const dirty = Object.keys(patch).length > 0
+
+  const upload = async (file?: File) => {
+    if (!file) return
+    setError('')
+    const res = await fetch(`/api/contacts/${encodeURIComponent(c.id)}/avatar`, { method: 'POST', headers: { 'content-type': file.type }, body: file })
+    if (!res.ok) setError((await res.json().catch(() => null))?.error ?? `Upload failed (${res.status})`)
+  }
+
+  return (
+    <aside className="panel hidden min-h-0 flex-col items-center gap-4 overflow-y-auto p-5 lg:flex">
+      <label className="cursor-pointer" title="Change pfp">
+        <Avatar c={c} size="size-24 text-3xl" />
+        <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="sr-only" aria-label="Change pfp" onChange={(e) => upload(e.target.files?.[0])} />
+      </label>
+      <div className="text-center">
+        <div className="title-type text-2xl font-bold">{c.displayName}</div>
+        <div className="text-sm text-muted">{c.bio}</div>
+      </div>
+      {error && <div className="w-full bg-alert px-3 py-1 text-sm text-on-alert">{error}</div>}
+
+      <form
+        className="flex w-full flex-col gap-2 text-sm"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (dirty) onSave(patch)
+        }}
+      >
+        <label className="flex flex-col gap-1 font-bold">
+          Name
+          <input value={form.displayName} onChange={set('displayName')} maxLength={40} className="field px-3 py-1.5 font-normal" />
+        </label>
+        <label className="flex flex-col gap-1 font-bold">
+          Model
+          <select value={form.model} onChange={set('model')} className="field px-3 py-1.5 font-normal">
+            {[...new Set([...MODELS, c.model])].map((m) => (
+              <option key={m}>{m}</option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 font-bold">
+          Folder
+          <input value={form.cwd} onChange={set('cwd')} className="field px-3 py-1.5 font-mono font-normal" />
+        </label>
+        <label className="flex flex-col gap-1 font-bold">
+          Budget (USD)
+          <input type="number" min="0.01" step="0.5" value={form.budget} onChange={set('budget')} className="field px-3 py-1.5 font-normal" />
+        </label>
+        <button type="submit" disabled={!dirty} className="btn bg-me py-1.5 text-on-me">
+          Save
+        </button>
+        <p className="text-xs text-muted">Name and pfp change now. Model, folder and budget apply from the next message.</p>
+      </form>
+
+      <div className="w-full text-sm">
+        <div className="mb-1 flex justify-between font-bold">
+          <span>Spent</span>
+          <span>${c.spentUsd.toFixed(2)} / ${c.budgetUsd.toFixed(2)}</span>
+        </div>
+        <div className="field h-3 overflow-hidden">
+          <div className="h-full bg-ok" style={{ width: `${Math.min(100, (c.spentUsd / c.budgetUsd) * 100)}%` }} />
+        </div>
+        <div className="mt-1 text-xs text-muted">Permissions: {c.permissionMode === 'default' ? 'ask first' : c.permissionMode}</div>
+      </div>
+      {c.sessionId && (
+        <button
+          className="btn mt-auto w-full bg-panel px-3 py-2 text-sm text-ink"
+          onClick={() => navigator.clipboard.writeText(`cd "${c.cwd}" && claude --resume ${c.sessionId}`)}
+        >
+          Copy resume command
+        </button>
+      )}
+    </aside>
+  )
+}
+
 export default function App() {
-  const { state, send } = useGcnb()
+  const { state, emit } = useGcnb()
   const [themeId, setThemeId] = useTheme()
   const [threadId, setThreadId] = useState<string | null>(null)
   const scroller = useRef<HTMLDivElement>(null)
@@ -183,7 +274,10 @@ export default function App() {
                 {c && <Avatar c={c} />}
                 <div className="min-w-0 flex-1">
                   <div className="flex justify-between gap-2">
-                    <span className="truncate font-bold">{t.title}</span>
+                    <span className="truncate font-bold">
+                      {c?.displayName ?? t.title}
+                      {c && <span className="ml-1.5 rounded-full px-1.5 text-[10px] font-normal opacity-70 b-tag">{c.agentName}</span>}
+                    </span>
                     <span className="shrink-0 text-xs opacity-70">{last && time(last.createdAt)}</span>
                   </div>
                   <div className="truncate text-sm opacity-80">
@@ -234,7 +328,7 @@ export default function App() {
               )}
             </div>
             {agent && !agent.live && <div className="bg-alert px-4 py-2 text-sm font-bold text-on-alert">{agent.reason}</div>}
-            <Composer name={contact.displayName} disabled={!state.connected} onSend={(text) => send(thread.id, text)} />
+            <Composer name={contact.displayName} disabled={!state.connected} onSend={(text) => emit({ type: 'send', threadId: thread.id, text })} />
           </>
         ) : (
           <div className="grid flex-1 place-items-center text-muted">{state.connected ? 'No chats yet' : 'Connecting to gcnb server…'}</div>
@@ -242,38 +336,7 @@ export default function App() {
       </main>
 
       {contact && (
-        <aside className="panel hidden min-h-0 flex-col items-center gap-4 overflow-y-auto p-5 lg:flex">
-          <Avatar c={contact} size="size-24 text-3xl" />
-          <div className="text-center">
-            <div className="title-type text-2xl font-bold">{contact.displayName}</div>
-            <div className="text-sm text-muted">{contact.bio}</div>
-          </div>
-          <dl className="grid w-full grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
-            <dt className="font-bold">Model</dt>
-            <dd className="text-right">{contact.model}</dd>
-            <dt className="font-bold">Folder</dt>
-            <dd className="truncate text-right font-mono" title={contact.cwd}>{contact.cwd}</dd>
-            <dt className="font-bold">Permissions</dt>
-            <dd className="text-right">{contact.permissionMode === 'default' ? 'Ask first' : contact.permissionMode}</dd>
-          </dl>
-          <div className="w-full text-sm">
-            <div className="mb-1 flex justify-between font-bold">
-              <span>Budget</span>
-              <span>${contact.spentUsd.toFixed(2)} / ${contact.budgetUsd.toFixed(2)}</span>
-            </div>
-            <div className="field h-3 overflow-hidden">
-              <div className="h-full bg-ok" style={{ width: `${Math.min(100, (contact.spentUsd / contact.budgetUsd) * 100)}%` }} />
-            </div>
-          </div>
-          {contact.sessionId && (
-            <button
-              className="btn mt-auto w-full bg-panel px-3 py-2 text-sm text-ink"
-              onClick={() => navigator.clipboard.writeText(`cd "${contact.cwd}" && claude --resume ${contact.sessionId}`)}
-            >
-              Copy resume command
-            </button>
-          )}
-        </aside>
+        <ContactCard key={contact.id} c={contact} onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })} />
       )}
     </div>
   )

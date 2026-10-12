@@ -1,42 +1,53 @@
 import Fastify from 'fastify'
 import { WebSocketServer, WebSocket } from 'ws'
-import { mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, readFileSync, statSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ClientEvent, type ServerEvent } from '@gcnb/shared'
 import { openDb } from './db.ts'
+import { loadAgents, setAgentModel } from './agents.ts'
 import { AgentRuntime } from './runtime/agent.ts'
 
 const root = fileURLToPath(new URL('../../..', import.meta.url))
 const port = Number(process.env.GCNB_PORT ?? 8787)
 const dataDir = process.env.GCNB_DATA_DIR ?? join(root, '.gcnb')
-mkdirSync(dataDir, { recursive: true })
+const avatarDir = join(dataDir, 'avatars')
+mkdirSync(avatarDir, { recursive: true })
 const db = openDb(join(dataDir, 'gcnb.db'))
 
-// Phase 1: one hardcoded contact. Phase 2 loads contacts from .claude/agents/*.md.
-db.seedContact(
-  {
-    id: 'bolt',
-    agentName: 'bolt',
-    displayName: 'Bolt',
-    avatarPath: null,
-    color: '#3ddc97',
-    bio: 'Writes and fixes code. Asks before running anything.',
-    model: process.env.GCNB_MODEL ?? 'sonnet',
-    cwd: process.env.GCNB_CWD ?? root,
-    permissionMode: 'default', // risky tools ask first (plan: Security)
-    budgetUsd: Number(process.env.GCNB_BUDGET_USD ?? 2),
-  },
-  'dm-bolt',
+// Contacts = the agent files. New ones are seeded once; after that the DB owns looks, folder, budget, session.
+const COLORS = ['#ffd23f', '#3ddc97', '#ff6b4a', '#b9a5ff', '#5ce1ff']
+const agentFiles = loadAgents(process.env.GCNB_AGENTS_DIR ?? join(root, '.claude', 'agents'))
+agentFiles.forEach((a, i) =>
+  db.seedContact(
+    {
+      id: a.name,
+      agentName: a.name,
+      displayName: a.name[0].toUpperCase() + a.name.slice(1),
+      avatarPath: null,
+      color: COLORS[i % COLORS.length],
+      bio: a.description,
+      model: a.model ?? process.env.GCNB_MODEL ?? 'sonnet',
+      cwd: resolve(process.env.GCNB_CWD ?? root),
+      // "allow everything": tools run without asking until Phase 3 approval cards. The server stays on 127.0.0.1.
+      permissionMode: a.permissionMode ?? process.env.GCNB_PERMISSION_MODE ?? 'bypassPermissions',
+      budgetUsd: Number(process.env.GCNB_BUDGET_USD ?? 2),
+    },
+    `dm-${a.name}`,
+  ),
 )
 
-const app = Fastify({ logger: { level: 'info' } })
-// Agents can run commands on this machine, so only browsers on our own origins may connect
-// (blocks other websites from opening a socket to 127.0.0.1).
+const app = Fastify({ logger: { level: 'info' }, bodyLimit: 2 * 1024 * 1024 })
+// Agents can run commands on this machine, so only browsers on our own origins may talk to the server
+// (blocks other websites from reaching 127.0.0.1).
 const allowedOrigins = new Set([
   `http://127.0.0.1:${port}`, `http://localhost:${port}`, 'http://127.0.0.1:5173', 'http://localhost:5173',
   ...(process.env.GCNB_ALLOWED_ORIGINS?.split(',') ?? []),
 ])
+app.addHook('onRequest', async (req, reply) => {
+  const origin = req.headers.origin
+  if (req.method !== 'GET' && origin && !allowedOrigins.has(origin)) return reply.code(403).send({ error: 'origin not allowed' })
+})
 const wss = new WebSocketServer({
   server: app.server,
   path: '/ws',
@@ -48,16 +59,67 @@ const broadcast = (e: ServerEvent) => {
   for (const c of wss.clients) if (c.readyState === WebSocket.OPEN) c.send(s)
 }
 
-const runtimes = new Map(db.contacts().map((c) => [c.id, new AgentRuntime(db, c.id, `dm-${c.id}`, broadcast)]))
+const runtimes = new Map(agentFiles.map((a) => [a.name, new AgentRuntime(db, a.name, `dm-${a.name}`, a, broadcast)]))
+// Only contacts that still have an agent file show up; a deleted file hides the contact but keeps its history.
+const visibleThreads = () => db.threads().filter((t) => t.contactIds.every((id) => runtimes.has(id)))
 
-const snapshot = (): ServerEvent => ({
-  type: 'snapshot',
-  contacts: db.contacts(),
-  threads: db.threads(),
-  messages: db.recentMessages(),
-  agents: [...runtimes.values()].map((r) => r.state()),
-  typing: [...runtimes.values()].filter((r) => r.typing).map((r) => r.contactId),
-})
+const snapshot = (): ServerEvent => {
+  const threads = visibleThreads()
+  return {
+    type: 'snapshot',
+    contacts: db.contacts().filter((c) => runtimes.has(c.id)),
+    threads,
+    messages: threads.flatMap((t) => db.recentMessages(t.id)),
+    agents: [...runtimes.values()].map((r) => r.state()),
+    typing: [...runtimes.values()].filter((r) => r.typing).map((r) => r.contactId),
+  }
+}
+
+const systemLine = (contactId: string, text: string) =>
+  broadcast({ type: 'message', message: db.addMessage({ threadId: `dm-${contactId}`, sender: 'system', contactId, kind: 'status', body: { text } }) })
+
+function handle(ev: ClientEvent) {
+  if (ev.type === 'send') {
+    // Phase 2 threads are DMs: exactly one member.
+    const rt = runtimes.get(db.threadContactIds(ev.threadId)[0] ?? '')
+    if (!rt) return
+    const state = rt.state()
+    const message = db.addMessage({ threadId: ev.threadId, sender: 'user', contactId: null, kind: 'text', body: { text: ev.text, delivered: state.live } })
+    broadcast({ type: 'message', message })
+    if (state.live) rt.send(ev.text)
+    else systemLine(rt.contactId, `Not delivered: ${state.reason}`)
+    return
+  }
+
+  // updateContact
+  const rt = runtimes.get(ev.contactId)
+  const c = db.contact(ev.contactId)
+  if (!rt || !c) return
+  const patch: Parameters<typeof db.updateContact>[1] = {}
+  if (ev.displayName) patch.displayName = ev.displayName
+  if (ev.budgetUsd !== undefined) patch.budgetUsd = ev.budgetUsd
+  if (ev.model && ev.model !== c.model) {
+    patch.model = ev.model
+    setAgentModel(agentFiles.find((a) => a.name === c.agentName)!.path, ev.model)
+  }
+  if (ev.cwd && resolve(ev.cwd) !== c.cwd) {
+    const cwd = resolve(ev.cwd)
+    let isDir = false
+    try {
+      isDir = statSync(cwd).isDirectory()
+    } catch {}
+    if (!isDir) return systemLine(c.id, `Folder not found: ${cwd}`)
+    patch.cwd = cwd
+    patch.sessionId = null // SDK sessions are stored per folder, so the old one can't be resumed from here
+  }
+  db.updateContact(c.id, patch)
+  if (patch.model || patch.cwd || patch.budgetUsd !== undefined) {
+    rt.restart() // new options take effect on the next message
+    if (patch.cwd) systemLine(c.id, `Now working in ${patch.cwd}. Sessions are stored per folder, so the next message starts a fresh one.`)
+  }
+  broadcast({ type: 'contact', contact: db.contact(c.id)! })
+  broadcast({ type: 'agent', agent: rt.state() })
+}
 
 wss.on('connection', (ws) => {
   ws.send(JSON.stringify(snapshot()))
@@ -70,19 +132,40 @@ wss.on('connection', (ws) => {
     }
     const parsed = ClientEvent.safeParse(json)
     if (!parsed.success) return app.log.warn({ issues: parsed.error.issues }, 'bad client event')
-    const ev = parsed.data
-    // Phase 1 threads are DMs: exactly one member.
-    const rt = runtimes.get(db.threadContactIds(ev.threadId)[0] ?? '')
-    if (!rt) return
-    const state = rt.state()
-    const message = db.addMessage({ threadId: ev.threadId, sender: 'user', contactId: null, kind: 'text', body: { text: ev.text, delivered: state.live } })
-    broadcast({ type: 'message', message })
-    if (state.live) rt.send(ev.text)
-    else broadcast({ type: 'message', message: db.addMessage({ threadId: ev.threadId, sender: 'system', contactId: rt.contactId, kind: 'status', body: { text: `Not delivered: ${state.reason}` } }) })
+    handle(parsed.data)
   })
 })
 
-app.get('/api/health', async () => ({ ok: true, agents: [...runtimes.values()].map((r) => r.state()) }))
+// Pfps. SVG is excluded on purpose: it can carry script.
+const IMAGE_TYPES: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }
+app.addContentTypeParser(Object.keys(IMAGE_TYPES), { parseAs: 'buffer' }, (_req, body, done) => done(null, body))
+
+app.post<{ Params: { id: string } }>('/api/contacts/:id/avatar', async (req, reply) => {
+  const c = db.contact(req.params.id)
+  const ext = IMAGE_TYPES[req.headers['content-type'] ?? '']
+  if (!c || !runtimes.has(c.id)) return reply.code(404).send({ error: 'no such contact' })
+  if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) return reply.code(415).send({ error: 'send a png, jpeg, webp or gif' })
+  for (const f of readdirSync(avatarDir)) if (f.startsWith(`${c.id}.`)) rmSync(join(avatarDir, f))
+  writeFileSync(join(avatarDir, `${c.id}.${ext}`), req.body)
+  db.updateContact(c.id, { avatarPath: `/api/avatars/${c.id}.${ext}?v=${Date.now()}` })
+  const contact = db.contact(c.id)!
+  broadcast({ type: 'contact', contact })
+  return contact
+})
+
+app.get<{ Params: { file: string } }>('/api/avatars/:file', async (req, reply) => {
+  const m = /^([a-z0-9][a-z0-9_-]*)\.(png|jpg|webp|gif)$/i.exec(req.params.file)
+  if (!m) return reply.code(404).send()
+  try {
+    const body = readFileSync(join(avatarDir, req.params.file))
+    const type = Object.entries(IMAGE_TYPES).find(([, e]) => e === m[2].toLowerCase())![0]
+    return reply.type(type).header('x-content-type-options', 'nosniff').send(body)
+  } catch {
+    return reply.code(404).send()
+  }
+})
+
+app.get('/api/health', async () => ({ ok: true, agents: [...runtimes.values()].map((r) => ({ ...r.state(), running: r.running })) }))
 
 const shutdown = async () => {
   for (const r of runtimes.values()) r.close()
@@ -94,4 +177,5 @@ process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)
 
 await app.listen({ host: '127.0.0.1', port }) // never 0.0.0.0; use `tailscale serve` for the phone
+if (!agentFiles.length) app.log.warn('no contacts: add agent files to .claude/agents/')
 if (!process.env.ANTHROPIC_API_KEY) app.log.warn('ANTHROPIC_API_KEY is not set: chat works, but agents will not reply')

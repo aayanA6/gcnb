@@ -2,9 +2,13 @@
 import { query, type PermissionMode, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import type { AgentState, Message, ServerEvent } from '@gcnb/shared'
 import type { Db } from '../db.ts'
+import type { AgentFile } from '../agents.ts'
 
 const PERSONA =
   'You are chatting with the user through gcnb, an iMessage-style app. Reply like a text message: short, plain, conversational. Use markdown only when sharing code.'
+
+// Close a contact's process after this long without a turn; the next message resumes the session.
+const IDLE_MS = Number(process.env.GCNB_IDLE_MIN ?? 30) * 60_000
 
 // Async queue that feeds the SDK's streaming input mode; push() never blocks.
 function inbox<T>() {
@@ -46,14 +50,21 @@ export function spendAfterResult(base: number, total: number, lifetime: boolean 
 export class AgentRuntime {
   private q?: Query
   private box?: ReturnType<typeof inbox<SDKUserMessage>>
+  private idleTimer?: NodeJS.Timeout
+  private restartAfterTurn = false
   typing = false
 
   constructor(
     private db: Db,
     readonly contactId: string,
     private threadId: string,
+    private agent: AgentFile,
     private emit: (e: ServerEvent) => void,
   ) {}
+
+  get running() {
+    return !!this.q
+  }
 
   private get contact() {
     return this.db.contact(this.contactId)!
@@ -70,13 +81,24 @@ export class AgentRuntime {
 
   /** Queues a user message into the session. Caller checks state().live first. */
   send(text: string) {
+    clearTimeout(this.idleTimer)
     if (!this.q) this.start()
     this.box!.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null } as SDKUserMessage)
   }
 
   close() {
+    clearTimeout(this.idleTimer)
     this.box?.close()
     this.q?.close()
+    // Detach now so a message arriving mid-shutdown starts a fresh process instead of a dead queue.
+    this.q = undefined
+    this.box = undefined
+  }
+
+  /** SDK options are fixed per process: close now (or after the current turn) and resume with new options on the next message. */
+  restart() {
+    if (this.typing) this.restartAfterTurn = true
+    else this.close()
   }
 
   private post(sender: Message['sender'], kind: Message['kind'], text: string) {
@@ -100,15 +122,19 @@ export class AgentRuntime {
         model: c.model,
         cwd: c.cwd,
         permissionMode: c.permissionMode as PermissionMode,
+        allowDangerouslySkipPermissions: c.permissionMode === 'bypassPermissions',
         includePartialMessages: true,
         maxBudgetUsd: Math.max(0, c.budgetUsd - c.spentUsd),
         disallowedTools: ['SendMessage', 'ListAgents'], // agents talk only through gcnb
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: PERSONA },
-        // Approval cards arrive in Phase 3; until then anything that would prompt is denied.
-        canUseTool: async (toolName) => ({
-          behavior: 'deny',
-          message: `gcnb can't show approval cards yet, so ${toolName} was denied. Tell the user what you wanted to run instead.`,
-        }),
+        // Run the session as the contact's own .claude/agents definition.
+        agents: { [this.agent.name]: { description: this.agent.description, prompt: `${this.agent.prompt}\n\n${PERSONA}`, tools: this.agent.tools } },
+        agent: this.agent.name,
+        // Approval cards arrive in Phase 3. Until then tools that would prompt are allowed;
+        // questions are pushed back to plain text because there's no chip UI to answer them.
+        canUseTool: async (toolName, input) =>
+          toolName === 'AskUserQuestion'
+            ? { behavior: 'deny', message: 'gcnb cannot show question chips yet. Ask your question as a normal text reply.' }
+            : { behavior: 'allow', updatedInput: input },
       },
     })
     this.q = q
@@ -147,15 +173,22 @@ export class AgentRuntime {
             else if (m.subtype !== 'success') this.post('system', 'status', `Turn stopped (${m.subtype})`)
             else if (m.is_error) this.post('system', 'status', `Error: ${m.result}`)
             this.emit({ type: 'agent', agent: this.state() })
+            if (this.restartAfterTurn) {
+              this.restartAfterTurn = false
+              this.close()
+            } else {
+              this.idleTimer = setTimeout(() => this.close(), IDLE_MS)
+            }
             break
           }
         }
       }
     } catch (err) {
-      this.post('system', 'status', `Agent error: ${err instanceof Error ? err.message : String(err)}`)
+      // A process we closed on purpose (idle, restart) has already been detached; stay quiet about it.
+      if (this.q === q) this.post('system', 'status', `Agent error: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
-      this.setTyping(false)
       if (this.q === q) {
+        this.setTyping(false)
         this.q = undefined
         this.box = undefined
       }

@@ -114,7 +114,7 @@ export function openDb(file: string) {
 
     contacts: (): Contact[] => db.select().from(contacts).all(),
     contact: (id: string): Contact | undefined => db.select().from(contacts).where(eq(contacts.id, id)).get(),
-    updateContact: (id: string, patch: Partial<Pick<Contact, 'sessionId' | 'spentUsd'>>) =>
+    updateContact: (id: string, patch: Partial<Omit<Contact, 'id' | 'agentName'>>) =>
       db.update(contacts).set(patch).where(eq(contacts.id, id)).run(),
 
     threads(): Thread[] {
@@ -133,9 +133,9 @@ export function openDb(file: string) {
       return toMessage(row)
     },
 
-    // Latest `limit` messages, oldest first. rowid breaks same-millisecond ties.
-    recentMessages: (limit = 500): Message[] =>
-      db.select().from(messages).orderBy(sql`rowid DESC`).limit(limit).all().reverse().map(toMessage),
+    // A thread's latest `limit` messages, oldest first. rowid breaks same-millisecond ties.
+    recentMessages: (threadId: string, limit = 300): Message[] =>
+      db.select().from(messages).where(eq(messages.threadId, threadId)).orderBy(sql`rowid DESC`).limit(limit).all().reverse().map(toMessage),
   }
 }
 

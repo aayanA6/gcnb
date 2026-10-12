@@ -49,6 +49,15 @@ export type AgentState = z.infer<typeof AgentState>
 
 export const ClientEvent = z.discriminatedUnion('type', [
   z.object({ type: z.literal('send'), threadId: z.string(), text: z.string().min(1).max(20000) }),
+  // Looks apply immediately; engine settings (model, folder, budget) apply from the next message.
+  z.object({
+    type: z.literal('updateContact'),
+    contactId: z.string(),
+    displayName: z.string().trim().min(1).max(40).optional(),
+    model: z.string().regex(/^[\w.:-]{1,64}$/).optional(),
+    cwd: z.string().min(1).max(500).optional(),
+    budgetUsd: z.number().positive().max(10000).optional(),
+  }),
 ])
 export type ClientEvent = z.infer<typeof ClientEvent>
 

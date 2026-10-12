@@ -50,9 +50,12 @@ Optional settings:
 | Variable | Default | Meaning |
 |---|---|---|
 | `GCNB_PORT` | `8787` | Server port (always bound to 127.0.0.1) |
-| `GCNB_MODEL` | `sonnet` | Model for the Phase 1 contact |
-| `GCNB_BUDGET_USD` | `2` | Contact's spend cap (`maxBudgetUsd`) |
-| `GCNB_CWD` | repo root | Folder the agent works in |
+| `GCNB_AGENTS_DIR` | `.claude/agents` | Where contacts come from |
+| `GCNB_MODEL` | `sonnet` | Model for new contacts whose agent file has no `model:` |
+| `GCNB_BUDGET_USD` | `2` | New contacts' spend cap (`maxBudgetUsd`) |
+| `GCNB_CWD` | repo root | Folder new contacts work in |
+| `GCNB_PERMISSION_MODE` | `bypassPermissions` | New contacts' permission mode (until Phase 3 approval cards) |
+| `GCNB_IDLE_MIN` | `30` | Close an idle contact's process after this many minutes; the next message resumes it |
 | `GCNB_DATA_DIR` | `.gcnb/` | Where `gcnb.db` lives |
 | `GCNB_ALLOWED_ORIGINS` | — | Extra browser origins allowed on the WebSocket (comma-separated) |
 
@@ -63,11 +66,15 @@ pnpm test        # SQLite history + session_id survive a reopen; spend math
 pnpm typecheck
 ```
 
-Phase 1 is done when you can chat with Bolt, restart the server, and see the history still there. Ask "what did I just say?" and Bolt should remember, because the SDK session resumes by `session_id`.
+## Contacts
+
+Every `.claude/agents/*.md` file becomes a contact: the frontmatter supplies `name`, `description`, `model` and `tools`, and the body is the agent's instructions. The repo ships a planner, coder and reviewer. Pfps, display names, colors, folders and budgets live in gcnb's database. You edit them from the contact card on the right; click the pfp to upload a new one.
+
+Each contact has its own SDK session. Restart the server, ask a contact "what did I just say?", and it should remember, because the session resumes by `session_id`.
 
 ## Security
 
-The server binds to `127.0.0.1` only, and the WebSocket rejects any origin that isn't gcnb's own. That matters because agents can run commands on your machine. Contacts use permission mode `default`, so risky tools ask first. Until approval cards ship in Phase 3, any tool that would ask is denied.
+Agents can run commands on your machine. The server binds to `127.0.0.1` only, and the WebSocket and every non-GET request reject origins that aren't gcnb's own. New contacts default to `bypassPermissions`, so tools run without asking until approval cards ship in Phase 3. For a stricter contact, set `permissionMode: default` in its agent file or `GCNB_PERMISSION_MODE=default`.
 
 ## Themes
 
