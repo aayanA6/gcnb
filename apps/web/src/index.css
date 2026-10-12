@@ -87,3 +87,14 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .dot { animation: none; opacity: 0.7; }
 }
+
+.rec-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 999px;
+  background: var(--colors-alert);
+  animation: blink 1s infinite ease-in-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot { animation: none; }
+}

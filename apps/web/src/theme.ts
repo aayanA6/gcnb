@@ -26,6 +26,7 @@ export function applyTheme(t: Theme) {
     for (const [k, v] of Object.entries(t[group])) root.style.setProperty(`--${group}-${k}`, v)
   root.style.setProperty('--wallpaper', t.wallpaper)
   root.style.colorScheme = t.dark ? 'dark' : 'light'
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t.colors.app) // phone status bar
 
   let link = document.getElementById('theme-fonts') as HTMLLinkElement | null
   if (!link) {

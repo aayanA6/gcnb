@@ -1,13 +1,16 @@
 import Fastify from 'fastify'
 import { WebSocketServer, WebSocket } from 'ws'
-import { mkdirSync, readFileSync, statSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ClientEvent, PERMISSION_MODES, type ServerEvent } from '@gcnb/shared'
+import { ClientEvent, PERMISSION_MODES, noteFor, type ServerEvent } from '@gcnb/shared'
+import { z } from 'zod'
 import { openDb } from './db.ts'
 import { loadAgents, setAgentModel } from './agents.ts'
 import { AgentRuntime } from './runtime/agent.ts'
 import { Router } from './router.ts'
+import { originAllowed, serveWeb } from './http.ts'
+import { Push } from './push.ts'
 
 const GROUP_CAP = Number(process.env.GCNB_GROUP_HOURLY_CAP_USD ?? 5)
 
@@ -17,6 +20,9 @@ const dataDir = process.env.GCNB_DATA_DIR ?? join(root, '.gcnb')
 const avatarDir = join(dataDir, 'avatars')
 mkdirSync(avatarDir, { recursive: true })
 const db = openDb(join(dataDir, 'gcnb.db'))
+const webDir = process.env.GCNB_WEB_DIR ?? join(root, 'apps', 'web', 'dist')
+const WHISPER_URL = process.env.GCNB_WHISPER_URL // a local Whisper server, e.g. whisper.cpp's /inference
+const STOP_AFTER_MIN = Number(process.env.GCNB_STOP_AFTER_MIN ?? 0) // 0 = keep running with no tabs open
 
 // Contacts = the agent files. New ones are seeded once; after that the DB owns looks, folder, budget, session.
 const COLORS = ['#ffd23f', '#3ddc97', '#ff6b4a', '#b9a5ff', '#5ce1ff']
@@ -41,25 +47,33 @@ agentFiles.forEach((a, i) =>
 )
 
 const app = Fastify({ logger: { level: 'info' }, bodyLimit: 2 * 1024 * 1024 })
-// Agents can run commands on this machine, so only browsers on our own origins may talk to the server
-// (blocks other websites from reaching 127.0.0.1).
-const allowedOrigins = new Set([
-  `http://127.0.0.1:${port}`, `http://localhost:${port}`, 'http://127.0.0.1:5173', 'http://localhost:5173',
-  ...(process.env.GCNB_ALLOWED_ORIGINS?.split(',') ?? []),
-])
+// Only gcnb's own pages may talk to the server (see originAllowed); GCNB_ALLOWED_ORIGINS adds more.
+const extraOrigins = new Set(process.env.GCNB_ALLOWED_ORIGINS?.split(',').filter(Boolean) ?? [])
+const hostOf = (h: Record<string, string | string[] | undefined>) => String(h['x-forwarded-host'] ?? h.host ?? '').split(',')[0].trim()
 app.addHook('onRequest', async (req, reply) => {
   const origin = req.headers.origin
-  if (req.method !== 'GET' && origin && !allowedOrigins.has(origin)) return reply.code(403).send({ error: 'origin not allowed' })
+  if (req.method !== 'GET' && origin && !originAllowed(origin, hostOf(req.headers), extraOrigins)) return reply.code(403).send({ error: 'origin not allowed' })
 })
 const wss = new WebSocketServer({
   server: app.server,
   path: '/ws',
-  verifyClient: ({ origin }: { origin: string }) => allowedOrigins.has(origin),
+  verifyClient: ({ origin, req }: { origin: string; req: { headers: Record<string, string | string[] | undefined> } }) => originAllowed(origin, hostOf(req.headers), extraOrigins),
 })
+
+// Notifications: push to every subscribed browser, but only while no open tab is looking at gcnb.
+const push = new Push(dataDir)
+const visible = new Set<WebSocket>()
+const notify = (e: ServerEvent) => {
+  if (e.type !== 'message' || visible.size || !push.count) return
+  const t = e.message.threadId.startsWith('g-') ? db.threads().find((t) => t.id === e.message.threadId) : undefined
+  const note = noteFor(e.message, (id) => db.contact(id)?.displayName ?? id, t?.title)
+  if (note) push.send(note)
+}
 
 const broadcast = (e: ServerEvent) => {
   const s = JSON.stringify(e)
   for (const c of wss.clients) if (c.readyState === WebSocket.OPEN) c.send(s)
+  notify(e)
 }
 
 // Cards left open by a previous run can't be answered: their canUseTool promise died with that process.
@@ -103,8 +117,9 @@ const snapshot = (): ServerEvent => {
 const systemLine = (contactId: string, text: string) =>
   broadcast({ type: 'message', message: db.addMessage({ threadId: `dm-${contactId}`, sender: 'system', contactId, kind: 'status', body: { text } }) })
 
-function handle(ev: ClientEvent) {
+function handle(ev: ClientEvent, ws: WebSocket) {
   if (ev.type === 'send') return router.post(ev.threadId, ev.text)
+  if (ev.type === 'visible') return void (ev.on ? visible.add(ws) : visible.delete(ws))
 
   if (ev.type === 'createGroup') {
     const ids = [...new Set(ev.contactIds)].filter((id) => runtimes.has(id))
@@ -152,7 +167,19 @@ function handle(ev: ClientEvent) {
   broadcast({ type: 'agent', agent: rt.state() })
 }
 
+// Optional "stop a few minutes after the last tab closes" (GCNB_STOP_AFTER_MIN). Off by default,
+// because phone pings need the server running while no tab is open.
+let idleStop: NodeJS.Timeout | undefined
+const armIdleStop = () => {
+  if (STOP_AFTER_MIN > 0 && !wss.clients.size) idleStop = setTimeout(() => void shutdown(), STOP_AFTER_MIN * 60_000)
+}
+
 wss.on('connection', (ws) => {
+  clearTimeout(idleStop)
+  ws.on('close', () => {
+    visible.delete(ws)
+    armIdleStop()
+  })
   ws.send(JSON.stringify(snapshot()))
   ws.on('message', (raw) => {
     let json: unknown
@@ -163,7 +190,7 @@ wss.on('connection', (ws) => {
     }
     const parsed = ClientEvent.safeParse(json)
     if (!parsed.success) return app.log.warn({ issues: parsed.error.issues }, 'bad client event')
-    handle(parsed.data)
+    handle(parsed.data, ws)
   })
 })
 
@@ -196,9 +223,41 @@ app.get<{ Params: { file: string } }>('/api/avatars/:file', async (req, reply) =
   }
 })
 
+// What the web app needs to know at boot: the push key and whether local Whisper is set up.
+app.get('/api/config', async () => ({ vapidPublicKey: push.publicKey, whisper: !!WHISPER_URL }))
+
+const Subscription = z.object({ endpoint: z.string().url().startsWith('https://'), keys: z.object({ p256dh: z.string().max(200), auth: z.string().max(100) }) })
+app.post('/api/push/subscribe', async (req, reply) => {
+  const sub = Subscription.safeParse(req.body)
+  if (!sub.success) return reply.code(400).send({ error: 'bad subscription' })
+  push.subscribe(sub.data)
+  return { ok: true }
+})
+
+// Voice: the browser records, we hand the audio to your local Whisper server, so it never leaves the machine.
+app.addContentTypeParser(/^audio\//, { parseAs: 'buffer', bodyLimit: 25 * 1024 * 1024 }, (_req, body, done) => done(null, body))
+app.post('/api/transcribe', async (req, reply) => {
+  if (!WHISPER_URL) return reply.code(404).send({ error: 'set GCNB_WHISPER_URL to use local Whisper' })
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return reply.code(415).send({ error: 'send recorded audio' })
+  const form = new FormData()
+  form.append('file', new Blob([new Uint8Array(req.body)], { type: req.headers['content-type'] }), 'speech.webm')
+  form.append('response_format', 'json')
+  if (process.env.GCNB_WHISPER_MODEL) form.append('model', process.env.GCNB_WHISPER_MODEL) // OpenAI-style servers need one
+  try {
+    const res = await fetch(WHISPER_URL, { method: 'POST', body: form })
+    if (!res.ok) return reply.code(502).send({ error: `Whisper answered ${res.status}` })
+    const { text } = (await res.json()) as { text?: string }
+    return { text: String(text ?? '').trim() }
+  } catch (err) {
+    return reply.code(502).send({ error: `Whisper unreachable: ${(err as Error).message}` })
+  }
+})
+
 app.get('/api/health', async () => ({ ok: true, agents: [...runtimes.values()].map((r) => ({ ...r.state(), running: r.running })) }))
 
-const shutdown = async () => {
+if (existsSync(join(webDir, 'index.html'))) serveWeb(app, webDir)
+
+async function shutdown() {
   for (const r of runtimes.values()) r.shutdown()
   await app.close()
   db.close()
@@ -208,5 +267,6 @@ process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)
 
 await app.listen({ host: '127.0.0.1', port }) // never 0.0.0.0; use `tailscale serve` for the phone
+armIdleStop()
 if (!agentFiles.length) app.log.warn('no contacts: add agent files to .claude/agents/')
 if (!process.env.ANTHROPIC_API_KEY) app.log.warn('ANTHROPIC_API_KEY is not set: chat works, but agents will not reply')

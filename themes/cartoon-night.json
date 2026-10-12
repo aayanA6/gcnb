@@ -1,0 +1,35 @@
+{
+  "name": "Cartoon Night",
+  "description": "Cartoon after dark: same chunky outlines and bubbly type, lights off",
+  "dark": true,
+  "fontsUrl": "https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600;700&family=Fredoka:wght@600;700&family=JetBrains+Mono&display=swap",
+  "colors": {
+    "app": "#14121e",
+    "panel": "#221f33",
+    "ink": "#f3f1ff",
+    "muted": "#a9a4c7",
+    "line": "#b9b2ea",
+    "accent": "#ffd23f",
+    "on-accent": "#1d1b2e",
+    "me": "#4d6bff",
+    "on-me": "#ffffff",
+    "them": "#2e2a45",
+    "on-them": "#f3f1ff",
+    "field": "#1a1828",
+    "on-field": "#f3f1ff",
+    "alert": "#ff6b4a",
+    "on-alert": "#1d1b2e",
+    "ok": "#3ddc97"
+  },
+  "fonts": {
+    "body": "'Baloo 2', system-ui, sans-serif",
+    "display": "'Fredoka', 'Baloo 2', system-ui, sans-serif",
+    "mono": "'JetBrains Mono', ui-monospace, monospace",
+    "display-case": "none",
+    "display-tracking": "0"
+  },
+  "radii": { "panel": "22px", "bubble": "20px", "button": "999px" },
+  "borders": { "panel": "2.5px solid #b9b2ea", "bubble": "2.5px solid #b9b2ea", "button": "2.5px solid #b9b2ea" },
+  "shadows": { "panel": "5px 5px 0 #05040a", "bubble": "3px 3px 0 #05040a", "button": "3px 3px 0 #05040a" },
+  "wallpaper": "radial-gradient(#3a3554 1.3px, transparent 1.4px) 0 0 / 18px 18px, #1b1928"
+}

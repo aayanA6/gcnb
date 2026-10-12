@@ -72,7 +72,24 @@ export const Message = z.object({
 })
 export type Message = z.infer<typeof Message>
 
-export const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const
+// A notification banner (push to your phone, or the in-page fallback). `urgent` = something needs you.
+export type Note = { title: string; body: string; threadId: string; tag: string; urgent: boolean }
+
+// Which messages ping you: an open card or a paused group (needs you), or an agent's reply (finished).
+// Replies share one tag per thread, so a burst of bubbles replaces one banner instead of buzzing each time.
+export function noteFor(m: Message, nameOf: (contactId: string) => string, groupTitle?: string): Note | null {
+  const where = groupTitle ? ` in #${groupTitle}` : ''
+  const card = (m.kind === 'approval' || m.kind === 'question') && m.body.status === 'pending'
+  if (card && m.contactId)
+    return { title: `${nameOf(m.contactId)} needs you${where}`, body: m.body.detail ? `${m.body.text}: ${m.body.detail}` : m.body.text, threadId: m.threadId, tag: `${m.threadId}:needs`, urgent: true }
+  if (m.sender === 'system' && m.body.text.startsWith('Paused'))
+    return { title: `#${groupTitle ?? 'group'} paused`, body: m.body.text, threadId: m.threadId, tag: `${m.threadId}:needs`, urgent: true }
+  if (m.sender === 'agent' && m.kind === 'text' && m.contactId)
+    return { title: `${nameOf(m.contactId)}${where}`, body: m.body.text.slice(0, 300), threadId: m.threadId, tag: m.threadId, urgent: false }
+  return null
+}
+
+export const PERMISSION_MODES =['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const
 
 // Answering a card: approvals take a tapback, questions take answers keyed by question text.
 export const Decision = z.enum(['allow', 'always', 'deny'])
@@ -100,6 +117,7 @@ export const ClientEvent = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('answer'), actionId: z.string(), decision: Decision.optional(), answers: z.record(z.string(), z.string().max(5000)).optional() }),
   z.object({ type: z.literal('interrupt'), contactId: z.string() }), // stop button; also clears that contact's queue
+  z.object({ type: z.literal('visible'), on: z.boolean() }), // tab shown/hidden: push only when no tab is looking
   z.object({
     type: z.literal('createGroup'),
     title: z.string().trim().min(1).max(40),

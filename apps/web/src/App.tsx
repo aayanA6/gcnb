@@ -1,6 +1,8 @@
-import { useEffect, useReducer, useRef, useState } from 'react'
-import { HOP_LIMIT, PERMISSION_MODES, ServerEvent, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread, type Typing } from '@gcnb/shared'
+import { Fragment, useEffect, useReducer, useRef, useState } from 'react'
+import { HOP_LIMIT, PERMISSION_MODES, ServerEvent, noteFor, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread, type Typing } from '@gcnb/shared'
 import { applyTheme, themes } from './theme.ts'
+import { currentPings, enablePings, localNotify, onOpenThread, type Config, type Pings } from './pwa.ts'
+import { useVoice, voiceEngine, type Engine } from './voice.ts'
 
 type State = {
   connected: boolean
@@ -40,20 +42,29 @@ function reduce(s: State, e: Action): State {
 }
 
 // One socket to the server; reconnects every second and gets a fresh snapshot on open.
-function useGcnb() {
+// It also tells the server whether this tab is on screen, so phone pings only fire when nobody's looking.
+function useGcnb(onEvent: (e: ServerEvent) => void) {
   const [state, dispatch] = useReducer(reduce, initial)
   const ws = useRef<WebSocket | null>(null)
+  const handler = useRef(onEvent)
+  handler.current = onEvent
   useEffect(() => {
     let stopped = false
     let timer = 0
+    const send = (ev: ClientEvent) => ws.current?.readyState === WebSocket.OPEN && ws.current.send(JSON.stringify(ev))
+    const visibility = () => send({ type: 'visible', on: !document.hidden })
     const connect = () => {
       const sock = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`)
       ws.current = sock
-      sock.onopen = () => dispatch({ type: 'connected', on: true })
+      sock.onopen = () => {
+        dispatch({ type: 'connected', on: true })
+        visibility()
+      }
       sock.onmessage = (m) => {
         const parsed = ServerEvent.safeParse(JSON.parse(m.data))
-        if (parsed.success) dispatch(parsed.data)
-        else console.warn('bad server event', parsed.error)
+        if (!parsed.success) return console.warn('bad server event', parsed.error)
+        dispatch(parsed.data)
+        handler.current(parsed.data)
       }
       sock.onclose = () => {
         dispatch({ type: 'connected', on: false })
@@ -61,9 +72,11 @@ function useGcnb() {
       }
     }
     connect()
+    document.addEventListener('visibilitychange', visibility)
     return () => {
       stopped = true
       clearTimeout(timer)
+      document.removeEventListener('visibilitychange', visibility)
       ws.current?.close()
     }
   }, [])
@@ -71,24 +84,78 @@ function useGcnb() {
   return { state, emit }
 }
 
+function useMedia(query: string) {
+  const [on, setOn] = useState(() => matchMedia(query).matches)
+  useEffect(() => {
+    const mq = matchMedia(query)
+    const f = (e: MediaQueryListEvent) => setOn(e.matches)
+    mq.addEventListener('change', f)
+    return () => mq.removeEventListener('change', f)
+  }, [query])
+  return on
+}
+
+// Whether this tab is on screen right now (for "mark thread as seen").
+function usePageVisible() {
+  const [on, setOn] = useState(() => !document.hidden)
+  useEffect(() => {
+    const f = () => setOn(!document.hidden)
+    document.addEventListener('visibilitychange', f)
+    return () => document.removeEventListener('visibilitychange', f)
+  }, [])
+  return on
+}
+
+const load = <T,>(key: string, fallback: T): T => {
+  try {
+    const v = localStorage.getItem(key)
+    if (v !== null) return JSON.parse(v)
+  } catch {}
+  return fallback
+}
+const save = (key: string, v: unknown) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(v))
+  } catch {}
+}
+
+// First-run time, saved once: unread counts only look at messages after this, so upgrading
+// to the unread feature doesn't suddenly show a huge count for every old message.
+const SEEN_SINCE = (() => {
+  const existing = load<number | null>('gcnb.seenSince', null)
+  if (existing) return existing
+  const now = Date.now()
+  save('gcnb.seenSince', now)
+  return now
+})()
+
+// "Auto" follows the system's light/dark setting: Cartoon by day, Cartoon Night after dark.
+const AUTO = { light: 'cartoon', dark: 'cartoon-night' }
 function useTheme() {
   const [id, setId] = useState(() => {
-    try {
-      const saved = localStorage.getItem('gcnb.theme')
-      if (saved && themes[saved]) return saved
-    } catch {}
-    return 'cartoon'
+    const saved = load('gcnb.themeId', 'auto')
+    return saved === 'auto' || themes[saved] ? saved : 'auto'
   })
+  const dark = useMedia('(prefers-color-scheme: dark)')
+  const active = id === 'auto' ? AUTO[dark ? 'dark' : 'light'] : id
   useEffect(() => {
-    applyTheme(themes[id])
-    try {
-      localStorage.setItem('gcnb.theme', id)
-    } catch {}
-  }, [id])
+    applyTheme(themes[active])
+    save('gcnb.themeId', id)
+  }, [id, active])
   return [id, setId] as const
 }
 
 const time = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+
+// "Today · 2:14 PM" / "Yesterday · …" / weekday within a week / short date beyond that.
+function dateLabel(ms: number): string {
+  const d = new Date(ms)
+  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const days = Math.round((startOfDay(new Date()) - startOfDay(d)) / 86400000)
+  const day = days === 0 ? 'Today' : days === 1 ? 'Yesterday' : days < 7 ? d.toLocaleDateString([], { weekday: 'long' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  return `${day} · ${time(ms)}`
+}
+const DatePill = ({ ms }: { ms: number }) => <div className="self-center px-3 py-1 text-center text-xs font-bold text-muted">{dateLabel(ms)}</div>
 
 function Avatar({ c, size = 'size-10' }: { c: Contact; size?: string }) {
   if (c.avatarPath) return <img src={c.avatarPath} alt="" className={`${size} btn shrink-0 rounded-full object-cover`} />
@@ -145,7 +212,12 @@ const OUTCOME: Record<string, string> = {
 function ApprovalCard({ m, onAnswer }: { m: Message; onAnswer: (a: Answer) => void }) {
   const b = m.body
   return (
-    <div role="group" aria-label={b.text} className="bubble flex w-full max-w-md flex-col gap-2 self-start bg-them text-on-them">
+    <div
+      role="group"
+      aria-label={b.text}
+      className="bubble flex w-full max-w-md flex-col gap-2 self-start text-on-them"
+      style={{ background: 'color-mix(in srgb, var(--colors-accent) 14%, var(--colors-them))' }}
+    >
       <div className="font-bold">{b.text}</div>
       {b.detail && <pre className="field max-h-40 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs">{b.detail}</pre>}
       {b.status === 'pending' ? (
@@ -231,16 +303,69 @@ function QuestionCard({ m, onAnswer }: { m: Message; onAnswer: (a: Answer) => vo
   )
 }
 
-function Composer({ name, mentions, disabled, onSend }: { name: string; mentions?: string[]; disabled: boolean; onSend: (text: string) => void }) {
+const ICONS = {
+  back: 'M15 18l-6-6 6-6',
+  close: 'M18 6 6 18M6 6l12 12',
+  send: 'M5 12h14M13 6l6 6-6 6',
+  info: 'M12 16v-4M12 8h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18',
+  mic: 'M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3M5 11a7 7 0 0 0 14 0M12 18v3',
+  bell: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0',
+}
+const Icon = ({ d }: { d: keyof typeof ICONS }) => (
+  <svg aria-hidden viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
+    <path d={ICONS[d]} />
+  </svg>
+)
+
+const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`
+
+function Composer({ name, mentions, disabled, engine, onSend }: { name: string; mentions?: string[]; disabled: boolean; engine: Engine; onSend: (text: string) => void }) {
   const [text, setText] = useState('')
+  const [, tick] = useState(0)
+  const held = useRef(false) // recording started by holding Space
+  const voice = useVoice(engine, (t, send) => (send && !disabled ? onSend(t) : setText((cur) => (cur ? `${cur} ${t}` : t))))
+  const { rec } = voice
   const submit = () => {
+    if (rec) return voice.stop(true) // the arrow while talking sends what you said
     const t = text.trim()
     if (!t || disabled) return
     onSend(t)
     setText('')
   }
+
+  // Hold Space to talk (in an empty box, or with nothing focused); let go to drop the transcript in the box.
+  useEffect(() => {
+    if (!engine) return
+    const idle = (t: EventTarget | null) => t === document.body || (t instanceof HTMLTextAreaElement && t.dataset.composer !== undefined && !t.value)
+    const down = (e: KeyboardEvent) => {
+      if (e.key !== ' ' || !idle(e.target)) return
+      e.preventDefault() // a leading space is useless anyway
+      if (e.repeat && !rec && !held.current) {
+        held.current = true
+        voice.start()
+      }
+    }
+    const up = (e: KeyboardEvent) => {
+      if (e.key === ' ' && held.current) {
+        held.current = false
+        voice.stop(false)
+      }
+    }
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+    }
+  })
+  useEffect(() => {
+    if (!rec) return
+    const t = setInterval(() => tick((n) => n + 1), 500)
+    return () => clearInterval(t)
+  }, [rec])
+
   return (
-    <div className="rule-t">
+    <div className={`rule-t pb-[env(safe-area-inset-bottom)] ${rec ? 'bg-accent/30' : ''}`}>
       {mentions && (
         <div className="flex flex-wrap items-center gap-2 px-3 pt-2 text-xs">
           <span className="font-bold">Mention:</span>
@@ -251,25 +376,45 @@ function Composer({ name, mentions, disabled, onSend }: { name: string; mentions
           ))}
         </div>
       )}
-    <form className="flex gap-2 p-3" onSubmit={(e) => (e.preventDefault(), submit())}>
-      <textarea
-        rows={1}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-            e.preventDefault()
-            submit()
-          }
-        }}
-        placeholder={`Message ${name}…`}
-        aria-label={`Message ${name}`}
-        className="field max-h-40 flex-1 resize-none px-4 py-2"
-      />
-      <button type="submit" disabled={disabled || !text.trim()} className="btn bg-me px-5 text-on-me">
-        Send
-      </button>
-    </form>
+      {voice.error && <div className="px-4 pt-2 text-xs font-bold text-alert">{voice.error}</div>}
+      <form className="flex items-center gap-2 p-3" onSubmit={(e) => (e.preventDefault(), submit())}>
+        {rec ? (
+          <>
+            <button type="button" aria-label="Cancel recording" onClick={() => voice.stop(null)} className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink">
+              <Icon d="close" />
+            </button>
+            <div className="field flex min-w-0 flex-1 items-center gap-2 px-4 py-2" aria-live="polite">
+              <span className="rec-dot" aria-hidden />
+              <span className="font-mono text-sm font-bold">{clock(Date.now() - rec.startedAt)}</span>
+              <span className="truncate italic">{rec.text || 'Listening…'}</span>
+            </div>
+          </>
+        ) : (
+          <textarea
+            rows={1}
+            value={text}
+            data-composer
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault()
+                submit()
+              }
+            }}
+            placeholder={`Message ${name}…${engine ? ' (hold Space to talk)' : ''}`}
+            aria-label={`Message ${name}`}
+            className="field max-h-40 min-w-0 flex-1 resize-none px-4 py-2"
+          />
+        )}
+        {engine && !rec && (
+          <button type="button" aria-label="Talk" title="Talk (or hold Space)" onClick={voice.start} className="btn grid size-10 shrink-0 place-items-center bg-ok text-on-accent">
+            <Icon d="mic" />
+          </button>
+        )}
+        <button type="submit" aria-label="Send" disabled={rec ? rec.busy : disabled || !text.trim()} className="btn grid size-10 shrink-0 place-items-center bg-me text-on-me">
+          <Icon d="send" />
+        </button>
+      </form>
     </div>
   )
 }
@@ -304,8 +449,35 @@ const PERMISSION_LABELS: Record<PermissionMode, string> = {
 }
 const resumeCommand = (c: Contact) => `cd "${c.cwd}" && claude --resume ${c.sessionId}`
 
+// A spend bar: label, "$used / $cap", turns alert-colored at or over cap.
+function Meter({ label, used, cap }: { label: string; used: number; cap: number }) {
+  const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0
+  const over = cap > 0 && used >= cap
+  return (
+    <div className="w-full text-sm">
+      <div className="mb-1 flex justify-between font-bold">
+        <span>{label}</span>
+        <span>
+          ${used.toFixed(2)} / ${cap.toFixed(2)}
+        </span>
+      </div>
+      <div className="field h-3 overflow-hidden">
+        <div className={`h-full ${over ? 'bg-alert' : 'bg-ok'}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  )
+}
+
+// Right-hand panels are always shown on wide screens; on a phone they open as a drawer from the ⓘ button.
+const drawer = (open: boolean) => `${open ? 'fixed inset-2 z-20 flex' : 'hidden'} lg:static lg:z-auto lg:flex`
+const CloseDrawer = ({ onClose }: { onClose: () => void }) => (
+  <button aria-label="Close" onClick={onClose} className="btn grid size-9 place-items-center self-end bg-panel text-ink lg:hidden">
+    <Icon d="close" />
+  </button>
+)
+
 // Plan's contact card: pfp, bio, the three common edits on top, engine settings below.
-function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) => void }) {
+function ContactCard({ c, open, onClose, onSave }: { c: Contact; open: boolean; onClose: () => void; onSave: (patch: ContactPatch) => void }) {
   const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, budget: String(c.budgetUsd), permissionMode: c.permissionMode })
   const [error, setError] = useState('')
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm({ ...form, [k]: e.target.value })
@@ -327,7 +499,8 @@ function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) 
   }
 
   return (
-    <aside className="panel hidden min-h-0 flex-col items-center gap-4 overflow-y-auto p-5 lg:flex">
+    <aside className={`panel ${drawer(open)} min-h-0 flex-col items-center gap-4 overflow-y-auto p-5`}>
+      <CloseDrawer onClose={onClose} />
       <label className="cursor-pointer" title="Change pfp">
         <Avatar c={c} size="size-24 text-3xl" />
         <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="sr-only" aria-label="Change pfp" onChange={(e) => upload(e.target.files?.[0])} />
@@ -381,15 +554,7 @@ function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) 
         <p className="text-xs text-muted">Name and pfp change now. Model, folder, permissions and budget apply from the next message.</p>
       </form>
 
-      <div className="w-full text-sm">
-        <div className="mb-1 flex justify-between font-bold">
-          <span>Spent</span>
-          <span>${c.spentUsd.toFixed(2)} / ${c.budgetUsd.toFixed(2)}</span>
-        </div>
-        <div className="field h-3 overflow-hidden">
-          <div className="h-full bg-ok" style={{ width: `${Math.min(100, (c.spentUsd / c.budgetUsd) * 100)}%` }} />
-        </div>
-      </div>
+      <Meter label="Spent" used={c.spentUsd} cap={c.budgetUsd} />
       {c.sessionId && <CopyButton text={resumeCommand(c)} label="Open in terminal" className="mt-auto w-full" />}
     </aside>
   )
@@ -468,11 +633,14 @@ function NewGroup({ contacts, onCreate, onCancel }: { contacts: Contact[]; onCre
   )
 }
 
-function GroupInfo({ t, members, statusOf }: { t: Thread; members: Contact[]; statusOf: (c: Contact) => 'Needs you' | 'Typing' | 'Idle' }) {
+function GroupInfo({ t, members, open, onClose, statusOf }: { t: Thread; members: Contact[]; open: boolean; onClose: () => void; statusOf: (c: Contact) => 'Needs you' | 'Typing' | 'Idle' }) {
   const spent = t.spentHourUsd ?? 0
   return (
-    <aside className="panel hidden min-h-0 flex-col gap-4 overflow-y-auto p-5 lg:flex">
-      <div className="title-type text-2xl font-bold">Group info</div>
+    <aside className={`panel ${drawer(open)} min-h-0 flex-col gap-4 overflow-y-auto p-5`}>
+      <div className="flex items-center justify-between">
+        <div className="title-type text-2xl font-bold">Group info</div>
+        <CloseDrawer onClose={onClose} />
+      </div>
       <ul className="flex flex-col gap-3">
         {members.map((c) => {
           const s = statusOf(c)
@@ -494,19 +662,7 @@ function GroupInfo({ t, members, statusOf }: { t: Thread; members: Contact[]; st
       <div className="text-sm">
         Pauses after <b>{HOP_LIMIT}</b> agent-to-agent hand-offs without you.
       </div>
-      {t.hourlyCapUsd !== null && (
-        <div className="w-full text-sm">
-          <div className="mb-1 flex justify-between font-bold">
-            <span>Group spend this hour</span>
-            <span>
-              ${spent.toFixed(2)} / ${t.hourlyCapUsd.toFixed(2)}
-            </span>
-          </div>
-          <div className="field h-3 overflow-hidden">
-            <div className="h-full bg-ok" style={{ width: `${Math.min(100, (spent / t.hourlyCapUsd) * 100)}%` }} />
-          </div>
-        </div>
-      )}
+      {t.hourlyCapUsd !== null && <Meter label="Group spend this hour" used={spent} cap={t.hourlyCapUsd} />}
     </aside>
   )
 }
@@ -522,12 +678,89 @@ const TypingBubble = ({ c, showPfp }: { c: Contact; showPfp: boolean }) => (
   </div>
 )
 
+const PINGS_LABEL: Record<Exclude<Pings, 'unsupported'>, string> = {
+  off: 'Turn on pings',
+  local: 'Pings on (this tab)',
+  push: 'Pings on',
+  blocked: 'Pings blocked in browser settings',
+}
+const IS_IOS = /iPhone|iPad/.test(navigator.userAgent)
+
+// Pull-to-enable pings: a push subscription when the browser supports it, else the in-tab fallback.
+function PingsToggle({ pings, cfg, onChange }: { pings: Pings; cfg: Config | null; onChange: (p: Pings) => void }) {
+  const label = pings === 'unsupported' ? (IS_IOS ? 'Add gcnb to your Home Screen for pings' : 'No notifications in this browser') : PINGS_LABEL[pings]
+  const clickable = pings === 'off' || pings === 'local'
+  return (
+    <button
+      disabled={!clickable}
+      onClick={() => enablePings(cfg).then(onChange)}
+      className="btn flex items-center gap-2 bg-panel px-3 py-2 text-left text-sm text-ink disabled:opacity-70"
+    >
+      <Icon d="bell" />
+      <span className="min-w-0 flex-1">{label}</span>
+    </button>
+  )
+}
+
+// Reads ?t=<threadId> once (a notification deep link), then strips it from the URL.
+function initialDeepLinkThread(): string | null {
+  const u = new URL(location.href)
+  const t = u.searchParams.get('t')
+  if (t) {
+    u.searchParams.delete('t')
+    history.replaceState(null, '', u)
+  }
+  return t
+}
+
 export default function App() {
-  const { state, emit } = useGcnb()
+  const [cfg, setCfg] = useState<Config | null>(null)
+  useEffect(() => {
+    fetch('/api/config')
+      .then((r) => r.json())
+      .then(setCfg)
+      .catch(() => {})
+  }, [])
+
+  const [pings, setPings] = useState<Pings>('off')
+  useEffect(() => {
+    currentPings().then(setPings)
+  }, [])
+
   const [themeId, setThemeId] = useTheme()
-  const [threadId, setThreadId] = useState<string | null>(null)
+  const [threadId, setThreadId] = useState<string | null>(initialDeepLinkThread)
+  const [view, setView] = useState<'list' | 'chat'>(() => (threadId ? 'chat' : 'list'))
   const [creating, setCreating] = useState(false)
+  const [infoOpen, setInfoOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState<'all' | 'groups' | 'needs'>('all')
+  const [seen, setSeen] = useState<Record<string, number>>(() => load('gcnb.seen', {}))
+  const md = useMedia('(min-width: 768px)')
+  const pageVisible = usePageVisible()
   const scroller = useRef<HTMLDivElement>(null)
+
+  const selectThread = (id: string) => {
+    setThreadId(id)
+    setView('chat')
+    setInfoOpen(false)
+  }
+
+  // Local-notification fallback while the tab is hidden: push already covers the rest. Refs keep this
+  // callback (handed to useGcnb before `state` exists) reading the latest contacts/threads and pings mode.
+  const stateRef = useRef<State>(initial)
+  const pingsRef = useRef<Pings>(pings)
+  pingsRef.current = pings
+  const onEvent = (e: ServerEvent) => {
+    if (pingsRef.current !== 'local' || !document.hidden || e.type !== 'message') return
+    const nameOf = (id: string) => stateRef.current.contacts.find((c) => c.id === id)?.displayName ?? id
+    const th = stateRef.current.threads.find((t) => t.id === e.message.threadId)
+    const note = noteFor(e.message, nameOf, th?.kind === 'group' ? th.title : undefined)
+    if (note) localNotify(note, selectThread)
+  }
+  const { state, emit } = useGcnb(onEvent)
+  stateRef.current = state
+
+  useEffect(() => onOpenThread(selectThread), [])
 
   const byId = (id?: string | null) => state.contacts.find((c) => c.id === id)
   const membersOf = (t: Thread) => t.contactIds.map(byId).filter((c): c is Contact => !!c)
@@ -550,6 +783,20 @@ export default function App() {
     messages.some((m) => m.contactId === c.id && isOpenCard(m)) ? 'Needs you' : typers.includes(c) ? 'Typing' : 'Idle'
   const busy = members.filter((c) => statusOf(c) !== 'Idle')
   const answer = (m: Message) => (a: Answer) => emit({ type: 'answer', actionId: m.body.actionId!, ...a })
+
+  // Unread: agent replies newer than the later of "last time this thread was on screen" and first run.
+  const unreadCount = (tid: string) =>
+    state.messages.filter((m) => m.threadId === tid && m.sender === 'agent' && m.kind === 'text' && m.createdAt > Math.max(seen[tid] ?? 0, SEEN_SINCE)).length
+
+  const chatOnScreen = !!thread && (md || view === 'chat')
+  useEffect(() => {
+    if (!thread || !chatOnScreen || !pageVisible) return
+    setSeen((s) => {
+      const next = { ...s, [thread.id]: Date.now() }
+      save('gcnb.seen', next)
+      return next
+    })
+  }, [thread?.id, chatOnScreen, pageVisible, messages.length])
 
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight })
@@ -592,10 +839,54 @@ export default function App() {
     return t.kind === 'group' && last.sender === 'agent' ? `${byId(last.contactId)?.displayName}: ${last.body.text}` : last.body.text
   }
 
+  // Sidebar: search by title / member name / agent, pill filters, sorted by latest message.
+  const lastTime = (t: Thread) => state.messages.findLast((m) => m.threadId === t.id)?.createdAt ?? t.createdAt
+  const matchesQuery = (t: Thread) => {
+    const q = query.trim().toLowerCase()
+    if (!q) return true
+    return t.title.toLowerCase().includes(q) || membersOf(t).some((c) => c.displayName.toLowerCase().includes(q) || c.agentName.toLowerCase().includes(q))
+  }
+  const needsCount = state.threads.filter((t) => threadNeedsYou(t.id)).length
+  const visibleThreads = state.threads
+    .filter((t) => (filter === 'groups' ? t.kind === 'group' : filter === 'needs' ? threadNeedsYou(t.id) : true))
+    .filter(matchesQuery)
+    .sort((a, b) => lastTime(b) - lastTime(a))
+  const FILTERS = [
+    ['all', 'All'],
+    ['groups', 'Groups'],
+    ['needs', `Needs you · ${needsCount}`],
+  ] as const
+
+  const totalSpent = state.contacts.reduce((s, c) => s + c.spentUsd, 0)
+  const totalBudget = state.contacts.reduce((s, c) => s + c.budgetUsd, 0)
+
+  // A message row, with the date pill and date-aware grouping stripped out of the big ol' kind switch.
+  const renderMessage = (m: Message) => {
+    const who = byId(m.contactId)
+    if (m.body.handoff) return <HandoffPill m={m} from={byId(m.body.handoff.from)} to={byId(m.body.handoff.to)} />
+    if (m.kind === 'tool') return <ToolLine m={m} c={isGroup ? who : undefined} />
+    if (m.kind === 'approval') return <ApprovalCard m={m} onAnswer={answer(m)} />
+    if (m.kind === 'question') return <QuestionCard m={m} onAnswer={answer(m)} />
+    // In a group, agent bubbles carry their pfp and name.
+    if (isGroup && m.sender === 'agent' && who)
+      return (
+        <div className="flex max-w-[85%] items-end gap-2 self-start">
+          <Avatar c={who} size="size-7 text-[10px]" />
+          <div className="flex min-w-0 flex-col">
+            <div className="mb-1 text-xs font-bold">
+              {who.displayName} <span className="font-normal text-muted">· {who.agentName}</span>
+            </div>
+            <Bubble m={m} showReceipt={false} />
+          </div>
+        </div>
+      )
+    return <Bubble m={m} showReceipt={m.id === lastUserId} />
+  }
+
   return (
-    <div className="grid h-dvh grid-cols-1 gap-3 p-3 md:grid-cols-[260px_1fr] lg:grid-cols-[260px_1fr_280px]">
-      <aside className="panel hidden min-h-0 flex-col gap-4 p-4 md:flex">
-        <div className="flex items-start justify-between">
+    <div className="grid h-dvh grid-cols-1 gap-2 p-2 md:grid-cols-[260px_1fr] md:gap-3 md:p-3 lg:grid-cols-[260px_1fr_280px]">
+      <aside className={`panel min-h-0 flex-col gap-3 p-3 md:flex md:gap-4 md:p-4 ${view === 'list' ? 'flex' : 'hidden'}`}>
+        <div className="flex items-start justify-between gap-2">
           <div>
             <div className="title-type text-3xl font-bold">gcnb</div>
             <div className="text-xs text-muted">gc, no burger</div>
@@ -614,22 +905,47 @@ export default function App() {
             }}
           />
         )}
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search chats"
+          aria-label="Search chats"
+          className="field px-3 py-2 text-sm"
+        />
+        <div className="flex flex-wrap gap-1.5 text-xs" role="group" aria-label="Filter chats">
+          {FILTERS.map(([id, label]) => (
+            <button
+              key={id}
+              aria-pressed={filter === id}
+              onClick={() => setFilter(id)}
+              className={`btn px-2.5 py-1 font-bold ${filter === id ? 'bg-accent text-on-accent' : 'bg-panel text-ink'}`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <nav className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto" aria-label="Chats">
-          {state.threads.map((t) => {
+          {visibleThreads.map((t) => {
             const ms = membersOf(t)
             const c = t.kind === 'dm' ? ms[0] : undefined
             const last = state.messages.findLast((m) => m.threadId === t.id)
             const active = t.id === thread?.id
+            const unread = unreadCount(t.id)
             return (
               <button
                 key={t.id}
-                onClick={() => setThreadId(t.id)}
+                onClick={() => selectThread(t.id)}
                 aria-current={active}
-                className={`flex items-center gap-3 rounded-bubble p-2 text-left ${active ? 'btn bg-accent text-on-accent' : ''}`}
+                className={`flex min-h-10 items-center gap-3 rounded-bubble p-2 text-left ${active ? 'btn bg-accent text-on-accent' : ''}`}
               >
                 <div className="relative">
                   {c ? <Avatar c={c} /> : <Stack cs={ms} />}
                   {threadNeedsYou(t.id) && <span className="absolute -right-0.5 -bottom-0.5 size-3.5 rounded-full bg-alert b-tag" aria-label="needs you" />}
+                  {unread > 0 && (
+                    <span className="btn absolute -top-1 -right-1 grid size-5 place-items-center rounded-full bg-alert px-1 text-[10px] text-on-alert" aria-label={`${unread} unread`}>
+                      {unread > 9 ? '9+' : unread}
+                    </span>
+                  )}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex justify-between gap-2">
@@ -644,23 +960,32 @@ export default function App() {
               </button>
             )
           })}
+          {visibleThreads.length === 0 && <div className="p-2 text-sm text-muted">No chats match</div>}
         </nav>
-        <label className="flex flex-col gap-1 text-xs font-bold">
-          Theme
-          <select value={themeId} onChange={(e) => setThemeId(e.target.value)} className="field px-3 py-2 text-sm">
-            {Object.entries(themes).map(([id, t]) => (
-              <option key={id} value={id}>
-                {t.name}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="flex flex-col gap-2">
+          <Meter label="Spent so far" used={totalSpent} cap={totalBudget} />
+          <PingsToggle pings={pings} cfg={cfg} onChange={setPings} />
+          <label className="flex flex-col gap-1 text-xs font-bold">
+            Theme
+            <select value={themeId} onChange={(e) => setThemeId(e.target.value)} className="field px-3 py-2 text-sm">
+              <option value="auto">Auto (light / dark)</option>
+              {Object.entries(themes).map(([id, t]) => (
+                <option key={id} value={id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       </aside>
 
-      <main className="panel flex min-h-0 flex-col overflow-hidden">
+      <main className={`panel min-h-0 flex-col overflow-hidden md:flex ${view === 'chat' ? 'flex' : 'hidden'}`}>
         {thread && members.length ? (
           <>
-            <header className="rule-b flex items-center gap-3 p-4">
+            <header className="rule-b flex items-center gap-2 p-3 md:gap-3 md:p-4">
+              <button aria-label="Back to chats" onClick={() => setView('list')} className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink md:hidden">
+                <Icon d="back" />
+              </button>
               {contact ? <Avatar c={contact} /> : <Stack cs={members} size="size-9 text-xs" />}
               <div className="min-w-0 flex-1">
                 <div className="title-type truncate text-xl font-bold">{contact ? contact.displayName : `#${thread.title}`}</div>
@@ -674,36 +999,24 @@ export default function App() {
                   )}
                 </div>
               </div>
-              <span className={`btn px-3 py-1 text-xs ${statusTone}`}>{status}</span>
+              <span className={`btn hidden shrink-0 px-3 py-1 text-xs sm:inline-block ${statusTone}`}>{status}</span>
               {contact?.sessionId && <CopyButton text={resumeCommand(contact)} label="Open in terminal" className="hidden sm:block" />}
               {busy.length > 0 && (
-                <button className="btn bg-alert px-3 py-1.5 text-sm text-on-alert" onClick={() => busy.forEach((c) => emit({ type: 'interrupt', contactId: c.id }))}>
+                <button className="btn shrink-0 bg-alert px-3 py-1.5 text-sm text-on-alert" onClick={() => busy.forEach((c) => emit({ type: 'interrupt', contactId: c.id }))}>
                   {isGroup ? '❚❚ Pause all' : '■ Stop'}
                 </button>
               )}
+              <button aria-label="Chat info" onClick={() => setInfoOpen(true)} className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink lg:hidden">
+                <Icon d="info" />
+              </button>
             </header>
             <div ref={scroller} className="wallpaper flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4" aria-live="polite">
-              {messages.map((m) => {
-                const who = byId(m.contactId)
-                if (m.body.handoff) return <HandoffPill key={m.id} m={m} from={byId(m.body.handoff.from)} to={byId(m.body.handoff.to)} />
-                if (m.kind === 'tool') return <ToolLine key={m.id} m={m} c={isGroup ? who : undefined} />
-                if (m.kind === 'approval') return <ApprovalCard key={m.id} m={m} onAnswer={answer(m)} />
-                if (m.kind === 'question') return <QuestionCard key={m.id} m={m} onAnswer={answer(m)} />
-                // In a group, agent bubbles carry their pfp and name.
-                if (isGroup && m.sender === 'agent' && who)
-                  return (
-                    <div key={m.id} className="flex max-w-[85%] items-end gap-2 self-start">
-                      <Avatar c={who} size="size-7 text-[10px]" />
-                      <div className="flex min-w-0 flex-col">
-                        <div className="mb-1 text-xs font-bold">
-                          {who.displayName} <span className="font-normal text-muted">· {who.agentName}</span>
-                        </div>
-                        <Bubble m={m} showReceipt={false} />
-                      </div>
-                    </div>
-                  )
-                return <Bubble key={m.id} m={m} showReceipt={m.id === lastUserId} />
-              })}
+              {messages.map((m, i) => (
+                <Fragment key={m.id}>
+                  {(i === 0 || m.createdAt - messages[i - 1].createdAt > 1_800_000) && <DatePill ms={m.createdAt} />}
+                  {renderMessage(m)}
+                </Fragment>
+              ))}
               {typers.map((c) => (
                 <TypingBubble key={c.id} c={c} showPfp={isGroup} />
               ))}
@@ -713,6 +1026,7 @@ export default function App() {
               name={contact ? contact.displayName : `#${thread.title}`}
               mentions={isGroup ? members.map((c) => c.displayName) : undefined}
               disabled={!state.connected}
+              engine={voiceEngine(cfg?.whisper ?? false)}
               onSend={(text) => emit({ type: 'send', threadId: thread.id, text })}
             />
           </>
@@ -721,8 +1035,16 @@ export default function App() {
         )}
       </main>
 
-      {thread && isGroup && <GroupInfo t={thread} members={members} statusOf={statusOf} />}
-      {contact && <ContactCard key={contact.id} c={contact} onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })} />}
+      {thread && isGroup && <GroupInfo t={thread} members={members} statusOf={statusOf} open={infoOpen} onClose={() => setInfoOpen(false)} />}
+      {contact && (
+        <ContactCard
+          key={contact.id}
+          c={contact}
+          open={infoOpen}
+          onClose={() => setInfoOpen(false)}
+          onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })}
+        />
+      )}
     </div>
   )
 }
