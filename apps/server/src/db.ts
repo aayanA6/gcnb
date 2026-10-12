@@ -133,6 +133,24 @@ export function openDb(file: string) {
       return toMessage(row)
     },
 
+    message(id: string): Message | undefined {
+      const r = db.select().from(messages).where(eq(messages.id, id)).get()
+      return r && toMessage(r)
+    },
+    // Cards change state (pending -> allowed, answered, ...) by merging into their body.
+    patchMessageBody(id: string, patch: Partial<Message['body']>): Message | undefined {
+      const m = this.message(id)
+      if (!m) return
+      db.update(messages).set({ bodyJson: JSON.stringify({ ...m.body, ...patch }) }).where(eq(messages.id, id)).run()
+      return this.message(id)
+    },
+
+    // pending_actions backs an open canUseTool promise so its card survives a page refresh.
+    addAction: (a: typeof pendingActions.$inferInsert) => db.insert(pendingActions).values(a).run(),
+    action: (id: string) => db.select().from(pendingActions).where(eq(pendingActions.id, id)).get(),
+    setActionStatus: (id: string, status: string) => db.update(pendingActions).set({ status }).where(eq(pendingActions.id, id)).run(),
+    pendingActions: () => db.select().from(pendingActions).where(eq(pendingActions.status, 'pending')).all(),
+
     // A thread's latest `limit` messages, oldest first. rowid breaks same-millisecond ties.
     recentMessages: (threadId: string, limit = 300): Message[] =>
       db.select().from(messages).where(eq(messages.threadId, threadId)).orderBy(sql`rowid DESC`).limit(limit).all().reverse().map(toMessage),

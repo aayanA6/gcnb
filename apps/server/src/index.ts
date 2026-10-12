@@ -3,7 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { mkdirSync, readFileSync, statSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ClientEvent, type ServerEvent } from '@gcnb/shared'
+import { ClientEvent, PERMISSION_MODES, type ServerEvent } from '@gcnb/shared'
 import { openDb } from './db.ts'
 import { loadAgents, setAgentModel } from './agents.ts'
 import { AgentRuntime } from './runtime/agent.ts'
@@ -30,7 +30,7 @@ agentFiles.forEach((a, i) =>
       model: a.model ?? process.env.GCNB_MODEL ?? 'sonnet',
       cwd: resolve(process.env.GCNB_CWD ?? root),
       // "allow everything": tools run without asking until Phase 3 approval cards. The server stays on 127.0.0.1.
-      permissionMode: a.permissionMode ?? process.env.GCNB_PERMISSION_MODE ?? 'bypassPermissions',
+      permissionMode: [a.permissionMode, process.env.GCNB_PERMISSION_MODE].find((m) => PERMISSION_MODES.includes(m as never)) ?? 'bypassPermissions',
       budgetUsd: Number(process.env.GCNB_BUDGET_USD ?? 2),
     },
     `dm-${a.name}`,
@@ -57,6 +57,12 @@ const wss = new WebSocketServer({
 const broadcast = (e: ServerEvent) => {
   const s = JSON.stringify(e)
   for (const c of wss.clients) if (c.readyState === WebSocket.OPEN) c.send(s)
+}
+
+// Cards left open by a previous run can't be answered: their canUseTool promise died with that process.
+for (const a of db.pendingActions()) {
+  db.setActionStatus(a.id, 'expired')
+  db.patchMessageBody(JSON.parse(a.payloadJson).messageId, { status: 'expired' })
 }
 
 const runtimes = new Map(agentFiles.map((a) => [a.name, new AgentRuntime(db, a.name, `dm-${a.name}`, a, broadcast)]))
@@ -91,6 +97,14 @@ function handle(ev: ClientEvent) {
     return
   }
 
+  if (ev.type === 'answer') {
+    const action = db.action(ev.actionId)
+    const rt = action && runtimes.get(action.contactId)
+    if (!rt?.answer(ev.actionId, ev)) app.log.warn({ actionId: ev.actionId }, 'answer for a card that is not open')
+    return
+  }
+  if (ev.type === 'interrupt') return void runtimes.get(ev.contactId)?.interrupt()
+
   // updateContact
   const rt = runtimes.get(ev.contactId)
   const c = db.contact(ev.contactId)
@@ -98,6 +112,7 @@ function handle(ev: ClientEvent) {
   const patch: Parameters<typeof db.updateContact>[1] = {}
   if (ev.displayName) patch.displayName = ev.displayName
   if (ev.budgetUsd !== undefined) patch.budgetUsd = ev.budgetUsd
+  if (ev.permissionMode && ev.permissionMode !== c.permissionMode) patch.permissionMode = ev.permissionMode
   if (ev.model && ev.model !== c.model) {
     patch.model = ev.model
     setAgentModel(agentFiles.find((a) => a.name === c.agentName)!.path, ev.model)
@@ -113,7 +128,7 @@ function handle(ev: ClientEvent) {
     patch.sessionId = null // SDK sessions are stored per folder, so the old one can't be resumed from here
   }
   db.updateContact(c.id, patch)
-  if (patch.model || patch.cwd || patch.budgetUsd !== undefined) {
+  if (patch.model || patch.cwd || patch.permissionMode || patch.budgetUsd !== undefined) {
     rt.restart() // new options take effect on the next message
     if (patch.cwd) systemLine(c.id, `Now working in ${patch.cwd}. Sessions are stored per folder, so the next message starts a fresh one.`)
   }

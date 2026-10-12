@@ -70,6 +70,19 @@ pnpm typecheck
 
 Every `.claude/agents/*.md` file becomes a contact: the frontmatter supplies `name`, `description`, `model` and `tools`, and the body is the agent's instructions. The repo ships a planner, coder and reviewer. Pfps, display names, colors, folders and budgets live in gcnb's database. You edit them from the contact card on the right; click the pfp to upload a new one.
 
+## See and steer
+
+- Grey lines between bubbles show what the agent is doing ("Read src/auth.ts", "Ran npm test").
+- When a contact set to **Ask me first** wants to run a command or edit a file, an approval card appears:
+  - 👍 allow once (or press **Y**)
+  - ‼️ always allow
+  - 👎 deny (or press **N**)
+- Questions from the agent show up as tappable chips, plus "Other…".
+- **Stop** interrupts the current turn.
+- **Open in terminal** copies `claude --resume <id>` so the same session opens in the CLI.
+
+The reviewer ships as ask-first. Everyone else defaults to Allow everything; change it under "Before risky tools" on the contact card.
+
 Each contact has its own SDK session. Restart the server, ask a contact "what did I just say?", and it should remember, because the session resumes by `session_id`.
 
 ## Security

@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import { ServerEvent, type AgentState, type ClientEvent, type Contact, type Message, type Thread } from '@gcnb/shared'
+import { PERMISSION_MODES, ServerEvent, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread } from '@gcnb/shared'
 import { applyTheme, themes } from './theme.ts'
 
 type State = {
@@ -20,8 +20,10 @@ function reduce(s: State, e: Action): State {
       return { ...s, connected: e.on }
     case 'snapshot':
       return { ...s, contacts: e.contacts, threads: e.threads, messages: e.messages, typing: e.typing, agents: Object.fromEntries(e.agents.map((a) => [a.contactId, a])) }
-    case 'message':
-      return { ...s, messages: [...s.messages, e.message] }
+    case 'message': // a known id is a card changing state; otherwise it's new
+      return s.messages.some((m) => m.id === e.message.id)
+        ? { ...s, messages: s.messages.map((m) => (m.id === e.message.id ? e.message : m)) }
+        : { ...s, messages: [...s.messages, e.message] }
     case 'typing':
       return { ...s, typing: e.on ? [...new Set([...s.typing, e.contactId])] : s.typing.filter((id) => id !== e.contactId) }
     case 'agent':
@@ -110,6 +112,112 @@ function Bubble({ m, showReceipt }: { m: Message; showReceipt: boolean }) {
   )
 }
 
+type Answer = { decision?: Decision; answers?: Record<string, string> }
+
+// Small grey line between bubbles: what the agent is doing ("Read src/auth.ts", "Ran npm test").
+function ToolLine({ m }: { m: Message }) {
+  return <div className="b-dashed self-start rounded-button px-3 py-0.5 font-mono text-xs text-muted">{m.body.text}</div>
+}
+
+const OUTCOME: Record<string, string> = {
+  allow: '👍 Allowed once',
+  always: '‼️ Always allowed',
+  deny: '👎 Denied',
+  answered: 'Answered',
+  cancelled: 'Cancelled',
+  expired: 'Expired: gcnb restarted before you answered',
+}
+
+// Tapbacks: 👍 allow once (biggest, Y), ‼️ always allow, 👎 deny (N).
+function ApprovalCard({ m, onAnswer }: { m: Message; onAnswer: (a: Answer) => void }) {
+  const b = m.body
+  return (
+    <div role="group" aria-label={b.text} className="bubble flex w-full max-w-md flex-col gap-2 self-start bg-them text-on-them">
+      <div className="font-bold">{b.text}</div>
+      {b.detail && <pre className="field max-h-40 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs">{b.detail}</pre>}
+      {b.status === 'pending' ? (
+        <>
+          <button className="btn bg-ok py-2.5 text-base text-on-accent" onClick={() => onAnswer({ decision: 'allow' })}>
+            👍 Allow once <kbd className="ml-1 text-xs opacity-70">Y</kbd>
+          </button>
+          <div className="flex gap-2">
+            {b.canAlways && (
+              <button className="btn flex-1 bg-panel py-1.5 text-sm text-ink" onClick={() => onAnswer({ decision: 'always' })}>
+                ‼️ Always allow
+              </button>
+            )}
+            <button className="btn flex-1 bg-alert py-1.5 text-sm text-on-alert" onClick={() => onAnswer({ decision: 'deny' })}>
+              👎 Deny <kbd className="ml-1 text-xs opacity-70">N</kbd>
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="text-sm font-bold">{OUTCOME[b.status ?? ''] ?? b.status}</div>
+      )}
+    </div>
+  )
+}
+
+// AskUserQuestion as quick-reply chips plus "Other" for free text.
+function QuestionCard({ m, onAnswer }: { m: Message; onAnswer: (a: Answer) => void }) {
+  const b = m.body
+  const questions = b.questions ?? []
+  const [picked, setPicked] = useState<Record<string, string[]>>({})
+  const [other, setOther] = useState<Record<string, string | undefined>>({}) // undefined = "Other" closed
+  const answerFor = (q: Question) => [...(picked[q.question] ?? []), ...(other[q.question]?.trim() ? [other[q.question]!.trim()] : [])].join(', ')
+  const submit = (answers = Object.fromEntries(questions.map((q) => [q.question, answerFor(q)]))) => onAnswer({ answers })
+  const pick = (q: Question, label: string) => {
+    if (!q.multiSelect && questions.length === 1) return submit({ [q.question]: label }) // one tap answers
+    const cur = picked[q.question] ?? []
+    setPicked({ ...picked, [q.question]: q.multiSelect ? (cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label]) : [label] })
+    if (!q.multiSelect) setOther({ ...other, [q.question]: undefined })
+  }
+
+  return (
+    <div role="group" aria-label={b.text} className="bubble flex w-full max-w-md flex-col gap-3 self-start bg-them text-on-them">
+      {questions.map((q) => (
+        <div key={q.question} className="flex flex-col gap-2">
+          <div className="font-bold">{q.question}</div>
+          {b.status === 'pending' ? (
+            <div className="flex flex-wrap gap-2">
+              {q.options.map((o) => {
+                const on = picked[q.question]?.includes(o.label)
+                return (
+                  <button key={o.label} title={o.description} aria-pressed={on} onClick={() => pick(q, o.label)} className={`btn px-3 py-1 text-sm ${on ? 'bg-me text-on-me' : 'bg-panel text-ink'}`}>
+                    {o.label}
+                  </button>
+                )
+              })}
+              {other[q.question] === undefined ? (
+                <button className="b-dashed rounded-button px-3 py-1 text-sm" onClick={() => setOther({ ...other, [q.question]: '' })}>
+                  Other…
+                </button>
+              ) : (
+                <input
+                  autoFocus
+                  value={other[q.question]}
+                  onChange={(e) => setOther({ ...other, [q.question]: e.target.value })}
+                  onKeyDown={(e) => e.key === 'Enter' && questions.every(answerFor) && submit()}
+                  placeholder="Type your answer"
+                  aria-label={`Other answer to: ${q.question}`}
+                  className="field min-w-40 flex-1 px-3 py-1 text-sm"
+                />
+              )}
+            </div>
+          ) : (
+            <div className="text-sm">{b.answers?.[q.question] ? `→ ${b.answers[q.question]}` : OUTCOME[b.status ?? '']}</div>
+          )}
+        </div>
+      ))}
+      {b.status === 'pending' && (questions.length > 1 || questions.some((q) => q.multiSelect) || Object.values(other).some((v) => v !== undefined)) && (
+        <button className="btn self-end bg-me px-4 py-1 text-sm text-on-me" disabled={!questions.every(answerFor)} onClick={() => submit()}>
+          Send
+        </button>
+      )}
+    </div>
+  )
+}
+
 function Composer({ name, disabled, onSend }: { name: string; disabled: boolean; onSend: (text: string) => void }) {
   const [text, setText] = useState('')
   const submit = () => {
@@ -142,11 +250,38 @@ function Composer({ name, disabled, onSend }: { name: string; disabled: boolean;
 }
 
 const MODELS = ['sonnet', 'opus', 'haiku']
-type ContactPatch = { displayName?: string; model?: string; cwd?: string; budgetUsd?: number }
+
+// "Open in terminal": copies `claude --resume <id>` so the same session opens in the CLI.
+function CopyButton({ text, label, className = '' }: { text: string; label: string; className?: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      title={text}
+      className={`btn bg-panel px-3 py-1.5 text-sm text-ink ${className}`}
+      onClick={() =>
+        navigator.clipboard.writeText(text).then(() => {
+          setCopied(true)
+          setTimeout(() => setCopied(false), 1500)
+        })
+      }
+    >
+      {copied ? 'Copied resume command' : label}
+    </button>
+  )
+}
+type PermissionMode = (typeof PERMISSION_MODES)[number]
+type ContactPatch = { displayName?: string; model?: string; cwd?: string; budgetUsd?: number; permissionMode?: PermissionMode }
+const PERMISSION_LABELS: Record<PermissionMode, string> = {
+  default: 'Ask me first',
+  acceptEdits: 'Accept edits',
+  plan: 'Plan only',
+  bypassPermissions: 'Allow everything',
+}
+const resumeCommand = (c: Contact) => `cd "${c.cwd}" && claude --resume ${c.sessionId}`
 
 // Plan's contact card: pfp, bio, the three common edits on top, engine settings below.
 function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) => void }) {
-  const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, budget: String(c.budgetUsd) })
+  const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, budget: String(c.budgetUsd), permissionMode: c.permissionMode })
   const [error, setError] = useState('')
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm({ ...form, [k]: e.target.value })
 
@@ -156,6 +291,7 @@ function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) 
   if (form.model !== c.model) patch.model = form.model
   if (form.cwd.trim() && form.cwd.trim() !== c.cwd) patch.cwd = form.cwd.trim()
   if (budget > 0 && budget !== c.budgetUsd) patch.budgetUsd = budget
+  if (form.permissionMode !== c.permissionMode) patch.permissionMode = form.permissionMode as PermissionMode
   const dirty = Object.keys(patch).length > 0
 
   const upload = async (file?: File) => {
@@ -201,13 +337,23 @@ function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) 
           <input value={form.cwd} onChange={set('cwd')} className="field px-3 py-1.5 font-mono font-normal" />
         </label>
         <label className="flex flex-col gap-1 font-bold">
+          Before risky tools
+          <select value={form.permissionMode} onChange={set('permissionMode')} className="field px-3 py-1.5 font-normal">
+            {PERMISSION_MODES.map((p) => (
+              <option key={p} value={p}>
+                {PERMISSION_LABELS[p]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 font-bold">
           Budget (USD)
           <input type="number" min="0.01" step="0.5" value={form.budget} onChange={set('budget')} className="field px-3 py-1.5 font-normal" />
         </label>
         <button type="submit" disabled={!dirty} className="btn bg-me py-1.5 text-on-me">
           Save
         </button>
-        <p className="text-xs text-muted">Name and pfp change now. Model, folder and budget apply from the next message.</p>
+        <p className="text-xs text-muted">Name and pfp change now. Model, folder, permissions and budget apply from the next message.</p>
       </form>
 
       <div className="w-full text-sm">
@@ -218,16 +364,8 @@ function ContactCard({ c, onSave }: { c: Contact; onSave: (patch: ContactPatch) 
         <div className="field h-3 overflow-hidden">
           <div className="h-full bg-ok" style={{ width: `${Math.min(100, (c.spentUsd / c.budgetUsd) * 100)}%` }} />
         </div>
-        <div className="mt-1 text-xs text-muted">Permissions: {c.permissionMode === 'default' ? 'ask first' : c.permissionMode}</div>
       </div>
-      {c.sessionId && (
-        <button
-          className="btn mt-auto w-full bg-panel px-3 py-2 text-sm text-ink"
-          onClick={() => navigator.clipboard.writeText(`cd "${c.cwd}" && claude --resume ${c.sessionId}`)}
-        >
-          Copy resume command
-        </button>
-      )}
+      {c.sessionId && <CopyButton text={resumeCommand(c)} label="Open in terminal" className="mt-auto w-full" />}
     </aside>
   )
 }
@@ -245,12 +383,30 @@ export default function App() {
   const typing = !!contact && state.typing.includes(contact.id)
   const messages = state.messages.filter((m) => m.threadId === thread?.id)
   const lastUserId = messages.findLast((m) => m.sender === 'user')?.id
+  // "Needs you": an open approval/question card. Drives the unread dot, status pill and Y/N keys.
+  const isOpenCard = (m: Message) => (m.kind === 'approval' || m.kind === 'question') && m.body.status === 'pending'
+  const needsYou = (contactId: string) => state.messages.some((m) => m.contactId === contactId && isOpenCard(m))
+  const waiting = !!contact && needsYou(contact.id)
+  const answer = (m: Message) => (a: Answer) => emit({ type: 'answer', actionId: m.body.actionId!, ...a })
 
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight })
-  }, [messages.length, typing])
+  }, [messages.length, typing, waiting])
 
-  const status = !state.connected ? 'Reconnecting…' : typing ? 'Typing…' : agent?.live ? 'Online' : 'Offline'
+  // Fitts's law: Y allows once, N denies the newest open approval card (not while typing in a field).
+  const openApproval = messages.findLast((m) => m.kind === 'approval' && m.body.status === 'pending')
+  useEffect(() => {
+    if (!openApproval) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || (e.target as HTMLElement).closest('input, textarea, select, [contenteditable]')) return
+      const decision = e.key.toLowerCase() === 'y' ? 'allow' : e.key.toLowerCase() === 'n' ? 'deny' : null
+      if (decision) answer(openApproval)({ decision })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
+  const status = !state.connected ? 'Reconnecting…' : waiting ? 'Waiting on you' : typing ? 'Typing…' : agent?.live ? 'Online' : 'Offline'
 
   return (
     <div className="grid h-dvh grid-cols-1 gap-3 p-3 md:grid-cols-[260px_1fr] lg:grid-cols-[260px_1fr_280px]">
@@ -271,7 +427,12 @@ export default function App() {
                 aria-current={active}
                 className={`flex items-center gap-3 rounded-bubble p-2 text-left ${active ? 'btn bg-accent text-on-accent' : ''}`}
               >
-                {c && <Avatar c={c} />}
+                {c && (
+                  <div className="relative">
+                    <Avatar c={c} />
+                    {needsYou(c.id) && <span className="absolute -right-0.5 -bottom-0.5 size-3.5 rounded-full bg-alert b-tag" aria-label="needs you" />}
+                  </div>
+                )}
                 <div className="min-w-0 flex-1">
                   <div className="flex justify-between gap-2">
                     <span className="truncate font-bold">
@@ -281,7 +442,7 @@ export default function App() {
                     <span className="shrink-0 text-xs opacity-70">{last && time(last.createdAt)}</span>
                   </div>
                   <div className="truncate text-sm opacity-80">
-                    {c && state.typing.includes(c.id) ? <i>typing…</i> : (last?.body.text ?? 'Say hi')}
+                    {c && needsYou(c.id) ? <b>Needs you</b> : c && state.typing.includes(c.id) ? <i>typing…</i> : (last?.body.text ?? 'Say hi')}
                   </div>
                 </div>
               </button>
@@ -311,14 +472,30 @@ export default function App() {
                   working in <span className="font-mono">{contact.cwd}</span>
                 </div>
               </div>
-              <span className={`btn px-3 py-1 text-xs ${agent?.live && state.connected ? 'bg-ok text-on-accent' : 'bg-alert text-on-alert'}`}>
+              <span
+                className={`btn px-3 py-1 text-xs ${waiting ? 'bg-accent text-on-accent' : agent?.live && state.connected ? 'bg-ok text-on-accent' : 'bg-alert text-on-alert'}`}
+              >
                 {status}
               </span>
+              {contact.sessionId && <CopyButton text={resumeCommand(contact)} label="Open in terminal" className="hidden sm:block" />}
+              {(typing || waiting) && (
+                <button className="btn bg-alert px-3 py-1.5 text-sm text-on-alert" onClick={() => emit({ type: 'interrupt', contactId: contact.id })}>
+                  ■ Stop
+                </button>
+              )}
             </header>
             <div ref={scroller} className="wallpaper flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4" aria-live="polite">
-              {messages.map((m) => (
-                <Bubble key={m.id} m={m} showReceipt={m.id === lastUserId} />
-              ))}
+              {messages.map((m) =>
+                m.kind === 'tool' ? (
+                  <ToolLine key={m.id} m={m} />
+                ) : m.kind === 'approval' ? (
+                  <ApprovalCard key={m.id} m={m} onAnswer={answer(m)} />
+                ) : m.kind === 'question' ? (
+                  <QuestionCard key={m.id} m={m} onAnswer={answer(m)} />
+                ) : (
+                  <Bubble key={m.id} m={m} showReceipt={m.id === lastUserId} />
+                ),
+              )}
               {typing && (
                 <div className="bubble flex items-center gap-1 self-start bg-them py-3 text-on-them" aria-label={`${contact.displayName} is typing`}>
                   <span className="dot" />

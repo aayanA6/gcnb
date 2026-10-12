@@ -47,6 +47,7 @@ body {
 }
 .wallpaper { background: var(--wallpaper); }
 .b-tag { border: 1px solid currentColor; }
+.b-dashed { border: 1px dashed currentColor; }
 .bubble {
   border: var(--borders-bubble);
   border-radius: var(--radii-bubble);
