@@ -1,6 +1,6 @@
 # gcnb — gc, no burger
 
-An iMessage-style chat app for your Claude Code agents. Every agent is a **contact** with a name, a pfp and its own chat history. You DM it any time. It keeps its memory across restarts because gcnb holds one long-lived Claude Agent SDK session per contact and resumes it by `session_id`.
+An iMessage-style chat app for your Claude Code agents. Every agent is a **contact** with a name, a pfp and its own chat history. You DM it any time. It keeps its memory across restarts because gcnb holds one long-lived `claude` CLI process per contact and resumes it by `session_id`.
 
 Claude Code's own agent view is a list of rows in a terminal. gcnb gives you persistent contacts, (soon) group chats where agents hand work to each other, and a real GUI you can open from your phone over Tailscale.
 
@@ -9,7 +9,7 @@ See [PLAN.md](PLAN.md) for the roadmap.
 ## Layout
 
 ```
-apps/server/       Fastify + ws, agent runtimes (Claude Agent SDK), SQLite (better-sqlite3 + Drizzle)
+apps/server/       Fastify + ws, agent runtimes (drives the `claude` CLI), SQLite (better-sqlite3 + Drizzle)
 apps/web/          Vite + React + Tailwind chat UI
 packages/shared/   zod schemas for every WebSocket event
 themes/*.json      one token file per theme (Cartoon, HUD, Nightwatch, Citadel, Phosphor)
@@ -49,7 +49,7 @@ GCNB_WEB_DIR=apps/web/dist pnpm --filter @gcnb/server start
 /plugin install gcnb@gcnb
 ```
 
-`dist/server` and `dist/web` are committed, so installing needs no build step. `/gcnb` starts the bundled server detached and opens a browser tab; `/gcnb stop` stops it; `/gcnb status` reports whether it's running. The server outlives your Claude Code session — SQLite, pfps, VAPID keys and the server's installed `node_modules` live in `${CLAUDE_PLUGIN_DATA}`, never in the plugin's own folder, so they survive plugin updates. Put `ANTHROPIC_API_KEY=...` in `${CLAUDE_PLUGIN_DATA}/.env` the same way the repo's own `.env` supplies it in development.
+`dist/server` and `dist/web` are committed, so installing needs no build step. `/gcnb` starts the bundled server detached and opens a browser tab; `/gcnb stop` stops it; `/gcnb status` reports whether it's running. The server outlives your Claude Code session — SQLite, pfps, VAPID keys and the server's installed `node_modules` live in `${CLAUDE_PLUGIN_DATA}`, never in the plugin's own folder, so they survive plugin updates. No `.env` is needed: agents reply on your `claude` CLI login (see below).
 
 If you change the server or web app, run `pnpm build:plugin` and commit the result before publishing an update.
 
@@ -67,20 +67,23 @@ Open `https://<machine>.<tailnet>.ts.net` on your phone, **Add to Home Screen**,
 
 Set `GCNB_WHISPER_URL` to a local Whisper server's inference endpoint, e.g. whisper.cpp's `whisper-server --convert` at `http://127.0.0.1:8080/inference`, and recordings are transcribed on your machine. `GCNB_WHISPER_MODEL` additionally names a model for OpenAI-style servers that require one. With no `GCNB_WHISPER_URL` set, the composer's mic button falls back to the browser's own speech recognition (Chrome, Edge, Safari), which sends the audio to the browser vendor's cloud rather than keeping it on your machine.
 
-### ANTHROPIC_API_KEY
+### Auth: your Claude subscription
 
-Agents reply only when `ANTHROPIC_API_KEY` is set. gcnb uses the Agent SDK on your API key and is billed per token. Without the key the app still works: messages are saved, and the chat shows **"Set ANTHROPIC_API_KEY to enable live replies"**.
+Agents reply by running your own `claude` CLI as a subprocess, on your Claude subscription — no API key, no per-token billing. Sign in once:
 
-Set it in your shell before starting the server, or put it in a `.env` file at the repo root. The server reads that file automatically, and git ignores it:
-
+```sh
+claude
 ```
-ANTHROPIC_API_KEY=sk-ant-...
-```
+
+(any normal interactive login works; gcnb just needs `claude auth status` to report logged in). Without that, the app still works: messages are saved, and the chat shows **"claude CLI not found or not logged in (run `claude` once to sign in)"**.
+
+If `claude` isn't on your `PATH`, or you want gcnb to use a specific build, set `GCNB_CLAUDE_BIN` to its full path.
 
 Optional settings:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `GCNB_CLAUDE_BIN` | `claude` (resolved on `PATH`) | Path to the `claude` CLI executable |
 | `GCNB_PORT` | `8787` | Server port (always bound to 127.0.0.1) |
 | `GCNB_AGENTS_DIR` | `.claude/agents` | Where contacts come from |
 | `GCNB_MODEL` | `sonnet` | Model for new contacts whose agent file has no `model:` |

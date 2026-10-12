@@ -75,7 +75,7 @@ async function up() {
   const cwd = process.env.GCNB_CWD || process.cwd()
   const env = {
     ...process.env,
-    ...readEnvFile(path.join(dataDir, '.env')), // ANTHROPIC_API_KEY and friends
+    ...readEnvFile(path.join(dataDir, '.env')), // GCNB_CLAUDE_BIN and friends
     GCNB_DATA_DIR: dataDir,
     GCNB_WEB_DIR: path.join(root, 'dist', 'web'),
     GCNB_AGENTS_DIR: path.join(cwd, '.claude', 'agents'),

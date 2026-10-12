@@ -132,6 +132,7 @@ var ServerEvent = z.discriminatedUnion("type", [
 
 // src/index.ts
 import { z as z3 } from "zod";
+import { randomUUID as randomUUID3 } from "node:crypto";
 
 // src/db.ts
 import Database from "better-sqlite3";
@@ -334,21 +335,35 @@ ${m[2]}`;
 var setAgentModel = (path, model) => writeFileSync(path, withModel(readFileSync(path, "utf8"), model));
 
 // src/runtime/agent.ts
-import {
-  createSdkMcpServer,
-  query,
-  tool
-} from "@anthropic-ai/claude-agent-sdk";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { isAbsolute, relative } from "node:path";
-import { z as z2 } from "zod";
 var PERSONA = [
   "You are chatting with the user through gcnb, an iMessage-style app. Reply like a text message: short, plain, conversational. Use markdown only when sharing code.",
   'Group chat messages arrive prefixed like "[#group \xB7 from Name \xB7 members: a, b]". Your final reply in that turn posts to the group.',
   "To pass work to another member of that group, call the hand_off tool with their name and a self-contained message; the server delivers it and their reply posts to the group. Only hand off when someone else should act next."
 ].join("\n");
 var HAND_OFF = "mcp__gcnb__hand_off";
+var PERMISSION_PROMPT = "mcp__gcnb__permission_prompt";
 var IDLE_MS = Number(process.env.GCNB_IDLE_MIN ?? 30) * 6e4;
+var CLAUDE_BIN = process.env.GCNB_CLAUDE_BIN ?? "claude";
+function cliEnv() {
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  return env;
+}
+var authOk = null;
+function checkClaudeAuth() {
+  if (authOk === null) {
+    try {
+      authOk = spawnSync(CLAUDE_BIN, ["auth", "status"], { timeout: 1e4, windowsHide: true, env: cliEnv() }).status === 0;
+    } catch {
+      authOk = false;
+    }
+  }
+  return authOk;
+}
 function inbox() {
   const items = [];
   let wake = null;
@@ -438,7 +453,7 @@ var AgentRuntime = class {
   agent;
   emit;
   hooks;
-  q;
+  child;
   box;
   idleTimer;
   restartAfterTurn = false;
@@ -450,7 +465,7 @@ var AgentRuntime = class {
   // open canUseTool promises by action id
   typing = false;
   get running() {
-    return !!this.q;
+    return !!this.child;
   }
   /** The thread this contact's current turn belongs to (its DM when idle). */
   get threadId() {
@@ -461,8 +476,8 @@ var AgentRuntime = class {
   }
   state() {
     const c = this.contact;
-    if (!process.env.ANTHROPIC_API_KEY)
-      return { contactId: c.id, live: false, reason: "Set ANTHROPIC_API_KEY to enable live replies" };
+    if (!checkClaudeAuth())
+      return { contactId: c.id, live: false, reason: "claude CLI not found or not logged in (run `claude` once to sign in)" };
     if (c.spentUsd >= c.budgetUsd)
       return { contactId: c.id, live: false, reason: `${c.displayName} used the $${c.budgetUsd.toFixed(2)} budget` };
     return { contactId: c.id, live: true };
@@ -476,27 +491,30 @@ var AgentRuntime = class {
     if (this.current || !this.queue.length) return;
     const d = this.queue.shift();
     clearTimeout(this.idleTimer);
-    if (!this.q) this.start();
+    if (!this.child) this.start();
     this.current = { ...d, startSpent: this.contact.spentUsd };
-    this.box.push({ type: "user", message: { role: "user", content: d.text }, parent_tool_use_id: null });
+    this.box.push({ type: "user", message: { role: "user", content: d.text } });
   }
-  /** Stop button: Query.interrupt() ends the current turn, open cards are cancelled, queued messages dropped. */
+  /** Stop button: an interrupt control_request ends the current turn, open cards are cancelled, queued messages dropped. */
   async interrupt() {
     const dropped = this.queue.length;
     this.queue = [];
     if (dropped) this.post("system", "status", `Dropped ${dropped} queued message${dropped > 1 ? "s" : ""}`);
-    if (!this.q || !this.current) return;
+    if (!this.child || !this.current) return;
     this.interrupted = true;
     for (const id of [...this.pending.keys()]) this.settle(id, "cancelled", { behavior: "deny", message: "The user stopped this turn.", interrupt: true });
-    await this.q.interrupt().catch(() => {
-    });
+    try {
+      this.child.stdin.write(`${JSON.stringify({ type: "control_request", request_id: randomUUID2(), request: { subtype: "interrupt" } })}
+`);
+    } catch {
+    }
   }
   close() {
     clearTimeout(this.idleTimer);
     for (const id of [...this.pending.keys()]) this.settle(id, "cancelled", { behavior: "deny", message: "Session closed." });
     this.box?.close();
-    this.q?.close();
-    this.q = void 0;
+    this.child?.kill();
+    this.child = void 0;
     this.box = void 0;
     this.setTyping(false);
     this.current = void 0;
@@ -507,7 +525,7 @@ var AgentRuntime = class {
     this.queue = [];
     this.close();
   }
-  /** SDK options are fixed per process: close now (or after the current turn) and resume with new options on the next message. */
+  /** CLI args are fixed per process: close now (or after the current turn) and resume with new options on the next message. */
   restart() {
     if (this.current) this.restartAfterTurn = true;
     else this.close();
@@ -567,6 +585,16 @@ var AgentRuntime = class {
       opts.signal.addEventListener("abort", () => this.settle(actionId, "cancelled", { behavior: "deny", message: "Cancelled." }), { once: true });
     });
   };
+  /** The gcnb MCP server's permission_prompt tool: the CLI's --permission-prompt-tool. It never sends
+   * permission_suggestions (confirmed live), so "always allow" builds its own session-only rule for the tool. */
+  permissionPrompt(toolName, input, toolUseId) {
+    const suggestions = [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+    return this.canUseTool(toolName, input, { signal: new AbortController().signal, toolUseID: toolUseId ?? randomUUID2(), requestId: randomUUID2(), suggestions });
+  }
+  /** The gcnb MCP server's hand_off tool. */
+  handOffTool(to, message) {
+    return this.current ? this.hooks.handOff(this.contactId, this.current, to, message) : "No active turn.";
+  }
   post(sender, kind, text2, extra = {}) {
     const message = this.db.addMessage({ threadId: this.threadId, sender, contactId: this.contactId, kind, body: { text: text2, ...extra } });
     this.emit({ type: "message", message });
@@ -579,111 +607,146 @@ var AgentRuntime = class {
   start() {
     const c = this.contact;
     const box = inbox();
-    const gcnb = createSdkMcpServer({
-      name: "gcnb",
-      version: "1.0.0",
-      tools: [
-        tool(
-          "hand_off",
-          "Pass work to another member of the current group chat. The server delivers your message into their session and their reply posts to the group. Chains pause after a few hand-offs without the user.",
-          {
-            to: z2.string().describe('Name of the group member to hand off to, e.g. "coder"'),
-            message: z2.string().describe("Self-contained instructions for them: what to do and the context they need")
-          },
-          async ({ to, message }) => ({
-            content: [{ type: "text", text: this.current ? this.hooks.handOff(this.contactId, this.current, to, message) : "No active turn." }]
-          })
-        )
-      ]
-    });
-    const q = query({
-      prompt: box,
-      options: {
-        resume: c.sessionId ?? void 0,
-        model: c.model,
-        cwd: c.cwd,
-        permissionMode: c.permissionMode,
-        allowDangerouslySkipPermissions: c.permissionMode === "bypassPermissions",
-        includePartialMessages: true,
-        maxBudgetUsd: Math.max(0, c.budgetUsd - c.spentUsd),
-        disallowedTools: ["SendMessage", "ListAgents"],
-        // agents talk only through gcnb, where you can see it
-        mcpServers: { gcnb },
-        allowedTools: [HAND_OFF],
-        // routing is gcnb's own tool; never needs an approval card
-        // Run the session as the contact's own .claude/agents definition.
-        agents: {
-          [this.agent.name]: {
-            description: this.agent.description,
-            prompt: `${this.agent.prompt}
+    const mcpConfig = {
+      mcpServers: {
+        // Always loaded (not deferred behind tool search): hand_off must be visible to the model
+        // from turn 1, and permission_prompt is dispatched directly by the CLI's own permission engine.
+        gcnb: { type: "http", url: `${this.hooks.mcpUrl}/${this.contactId}`, headers: { Authorization: `Bearer ${this.hooks.mcpToken}` }, alwaysLoad: true }
+      }
+    };
+    const args = [
+      "-p",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--model",
+      c.model,
+      "--permission-mode",
+      c.permissionMode,
+      ...c.permissionMode === "bypassPermissions" ? ["--allow-dangerously-skip-permissions"] : [],
+      ...c.sessionId ? ["--resume", c.sessionId] : [],
+      "--max-budget-usd",
+      String(Math.max(0, c.budgetUsd - c.spentUsd)),
+      // Run the session as the contact's own .claude/agents definition, same as `claude --agent`.
+      "--agents",
+      JSON.stringify({
+        [this.agent.name]: {
+          description: this.agent.description,
+          prompt: `${this.agent.prompt}
 
 ${PERSONA}`,
-            tools: this.agent.tools && [...this.agent.tools, HAND_OFF]
-          }
-        },
-        agent: this.agent.name,
-        canUseTool: this.canUseTool
-      }
-    });
-    this.q = q;
-    this.box = box;
-    void this.consume(q, c.spentUsd);
-  }
-  async consume(q, base) {
-    let lifetime = null;
-    try {
-      for await (const m of q) {
-        if ("session_id" in m && m.session_id && m.session_id !== this.contact.sessionId) {
-          this.db.updateContact(this.contactId, { sessionId: m.session_id });
-          this.emit({ type: "contact", contact: this.contact });
+          tools: this.agent.tools && [...this.agent.tools, HAND_OFF]
         }
-        const group = this.hooks.isGroup(this.threadId);
-        switch (m.type) {
-          case "stream_event":
-            if (!m.parent_tool_use_id && !this.pending.size) this.setTyping(true);
-            break;
-          case "assistant": {
-            if (m.parent_tool_use_id || m.error) break;
-            for (const b of m.message.content) {
-              if (b.type === "text" && b.text.trim() && !group) this.post("agent", "text", b.text.trim());
-              if (b.type === "tool_use" && b.name !== "AskUserQuestion" && b.name !== HAND_OFF)
-                this.post("agent", "tool", describeTool(b.name, b.input, this.contact.cwd), { toolName: b.name });
-            }
-            break;
+      }),
+      "--agent",
+      this.agent.name,
+      // Agents talk only through gcnb, where you can see it; permission_prompt is internal plumbing, never a callable tool.
+      "--disallowedTools",
+      "SendMessage",
+      "ListAgents",
+      PERMISSION_PROMPT,
+      "--allowedTools",
+      HAND_OFF,
+      // routing is gcnb's own tool; never needs an approval card
+      "--mcp-config",
+      JSON.stringify(mcpConfig),
+      "--permission-prompt-tool",
+      PERMISSION_PROMPT
+    ];
+    const child = spawn(CLAUDE_BIN, args, { cwd: c.cwd, env: cliEnv(), windowsHide: true });
+    this.child = child;
+    this.box = box;
+    void this.pumpStdin(child, box);
+    void this.consume(child, c.spentUsd);
+  }
+  async pumpStdin(child, box) {
+    for await (const msg of box) {
+      try {
+        child.stdin.write(`${JSON.stringify(msg)}
+`);
+      } catch {
+      }
+    }
+  }
+  async consume(child, base) {
+    let lifetime = null;
+    let errored = false;
+    let stderr = "";
+    child.stderr.on("data", (d) => stderr += d.toString());
+    let buf = "";
+    try {
+      for await (const chunk of child.stdout) {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let m;
+          try {
+            m = JSON.parse(line);
+          } catch {
+            continue;
           }
-          case "result": {
-            const s = spendAfterResult(base, m.total_cost_usd, lifetime);
-            lifetime = s.lifetime;
-            this.db.updateContact(this.contactId, { spentUsd: s.spent });
+          if (typeof m.session_id === "string" && m.session_id !== this.contact.sessionId) {
+            this.db.updateContact(this.contactId, { sessionId: m.session_id });
             this.emit({ type: "contact", contact: this.contact });
-            const cost = this.current ? Math.max(0, s.spent - this.current.startSpent) : 0;
-            if (group && m.subtype === "success" && !m.is_error && m.result.trim()) this.post("agent", "text", m.result.trim(), { costUsd: cost });
-            if (group) this.hooks.groupTurnCost(this.threadId, cost);
-            if (this.interrupted) this.post("system", "status", "Stopped");
-            else if (m.subtype === "error_max_budget_usd") this.post("system", "status", "Paused: budget used up");
-            else if (m.subtype !== "success") this.post("system", "status", `Turn stopped (${m.subtype})`);
-            else if (m.is_error) this.post("system", "status", `Error: ${m.result}`);
-            this.interrupted = false;
-            this.setTyping(false);
-            this.current = void 0;
-            this.emit({ type: "agent", agent: this.state() });
-            if (this.restartAfterTurn) {
-              this.restartAfterTurn = false;
-              this.close();
-            } else if (this.queue.length) {
-              if (this.state().live) this.pump();
-              else this.dropQueue(this.state().reason ?? "offline");
-            } else {
-              this.idleTimer = setTimeout(() => this.close(), IDLE_MS);
+          }
+          const group = this.hooks.isGroup(this.threadId);
+          switch (m.type) {
+            case "stream_event":
+              if (!m.parent_tool_use_id && !this.pending.size) this.setTyping(true);
+              break;
+            case "assistant": {
+              if (m.parent_tool_use_id || m.error) break;
+              const content = m.message.content;
+              for (const b of content) {
+                if (b.type === "text" && b.text?.trim() && !group) this.post("agent", "text", b.text.trim());
+                if (b.type === "tool_use" && b.name !== "AskUserQuestion" && b.name !== HAND_OFF)
+                  this.post("agent", "tool", describeTool(b.name, b.input ?? {}, this.contact.cwd), { toolName: b.name });
+              }
+              break;
             }
-            break;
+            case "result": {
+              const s = spendAfterResult(base, m.total_cost_usd, lifetime);
+              lifetime = s.lifetime;
+              this.db.updateContact(this.contactId, { spentUsd: s.spent });
+              this.emit({ type: "contact", contact: this.contact });
+              const cost = this.current ? Math.max(0, s.spent - this.current.startSpent) : 0;
+              if (group && m.subtype === "success" && !m.is_error && m.result.trim()) this.post("agent", "text", m.result.trim(), { costUsd: cost });
+              if (group) this.hooks.groupTurnCost(this.threadId, cost);
+              if (this.interrupted) this.post("system", "status", "Stopped");
+              else if (m.subtype === "error_max_budget_usd") this.post("system", "status", "Paused: budget used up");
+              else if (m.subtype !== "success") this.post("system", "status", `Turn stopped (${m.subtype})`);
+              else if (m.is_error) this.post("system", "status", `Error: ${m.result}`);
+              this.interrupted = false;
+              this.setTyping(false);
+              this.current = void 0;
+              this.emit({ type: "agent", agent: this.state() });
+              if (this.restartAfterTurn) {
+                this.restartAfterTurn = false;
+                this.close();
+              } else if (this.queue.length) {
+                if (this.state().live) this.pump();
+                else this.dropQueue(this.state().reason ?? "offline");
+              } else {
+                this.idleTimer = setTimeout(() => this.close(), IDLE_MS);
+              }
+              break;
+            }
           }
         }
       }
     } catch (err) {
-      if (this.q === q) this.post("system", "status", `Agent error: ${err instanceof Error ? err.message : String(err)}`);
+      if (this.child === child) {
+        this.post("system", "status", `Agent error: ${err instanceof Error ? err.message : String(err)}`);
+        errored = true;
+      }
     } finally {
-      if (this.q === q) {
+      if (this.child === child) {
+        if (!errored && this.current) this.post("system", "status", `Agent error: process exited${stderr.trim() ? `: ${clip(stderr, 200)}` : ""}`);
         this.queue = [];
         this.close();
       }
@@ -694,6 +757,61 @@ ${PERSONA}`,
       this.emit({ type: "message", message: this.db.addMessage({ threadId: d.threadId, sender: "system", contactId: this.contactId, kind: "status", body: { text: `${this.contact.displayName}: not delivered (${reason})` } }) });
   }
 };
+
+// src/mcp.ts
+import { timingSafeEqual } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z as z2 } from "zod";
+function tokenMatches(got, want) {
+  const a = Buffer.from(got);
+  const b = Buffer.from(want);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+var methodNotAllowed = { jsonrpc: "2.0", error: { code: -32e3, message: "Method not allowed." }, id: null };
+function registerMcp(app2, runtimes2, token) {
+  app2.post("/mcp/:contactId", async (req, reply) => {
+    const auth = String(req.headers.authorization ?? "");
+    if (!tokenMatches(auth, `Bearer ${token}`)) return reply.code(401).send({ error: "unauthorized" });
+    const rt = runtimes2.get(req.params.contactId);
+    if (!rt) return reply.code(404).send({ error: "no such contact" });
+    const server = new McpServer({ name: "gcnb", version: "1.0.0" });
+    server.registerTool(
+      "hand_off",
+      {
+        description: "Pass work to another member of the current group chat. The server delivers your message into their session and their reply posts to the group. Chains pause after a few hand-offs without the user.",
+        inputSchema: {
+          to: z2.string().describe('Name of the group member to hand off to, e.g. "coder"'),
+          message: z2.string().describe("Self-contained instructions for them: what to do and the context they need")
+        }
+      },
+      async ({ to, message }) => ({ content: [{ type: "text", text: rt.handOffTool(to, message) }] })
+    );
+    server.registerTool(
+      "permission_prompt",
+      {
+        description: "Internal: ask the user for permission to use a tool.",
+        inputSchema: { tool_name: z2.string(), input: z2.object({}).passthrough(), tool_use_id: z2.string().optional() }
+      },
+      async ({ tool_name, input, tool_use_id }) => ({
+        content: [{ type: "text", text: JSON.stringify(await rt.permissionPrompt(tool_name, input, tool_use_id)) }]
+      })
+    );
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: void 0 });
+    reply.hijack();
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req.raw, reply.raw, req.body);
+    } finally {
+      reply.raw.on("close", () => {
+        void transport.close();
+        void server.close();
+      });
+    }
+  });
+  app2.get("/mcp/:contactId", async (_req, reply) => reply.hijack().raw.writeHead(405, { "content-type": "application/json" }).end(JSON.stringify(methodNotAllowed)));
+  app2.delete("/mcp/:contactId", async (_req, reply) => reply.hijack().raw.writeHead(405, { "content-type": "application/json" }).end(JSON.stringify(methodNotAllowed)));
+}
 
 // src/router.ts
 var HOUR = 36e5;
@@ -948,6 +1066,8 @@ for (const a of db.pendingActions()) {
   db.setActionStatus(a.id, "expired");
   db.patchMessageBody(JSON.parse(a.payloadJson).messageId, { status: "expired" });
 }
+var mcpToken = randomUUID3();
+var mcpUrl = `http://127.0.0.1:${port}/mcp`;
 var runtimes = /* @__PURE__ */ new Map();
 var router = new Router(db, runtimes, broadcast);
 for (const a of agentFiles)
@@ -956,9 +1076,12 @@ for (const a of agentFiles)
     new AgentRuntime(db, a.name, a, broadcast, {
       handOff: (from, d, to, message) => router.handOff(from, d, to, message),
       groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
-      isGroup: (threadId) => threadId.startsWith("g-")
+      isGroup: (threadId) => threadId.startsWith("g-"),
+      mcpUrl,
+      mcpToken
     })
   );
+registerMcp(app, runtimes, mcpToken);
 var trio = ["planner", "coder", "reviewer"];
 if (trio.every((id) => runtimes.has(id)) && !db.threads().some((t) => t.kind === "group"))
   db.createGroup({ title: "launch crew", contactIds: trio, leadContactId: "planner", hourlyCapUsd: GROUP_CAP });
@@ -1107,4 +1230,4 @@ process.on("SIGTERM", shutdown);
 await app.listen({ host: "127.0.0.1", port });
 armIdleStop();
 if (!agentFiles.length) app.log.warn("no contacts: add agent files to .claude/agents/");
-if (!process.env.ANTHROPIC_API_KEY) app.log.warn("ANTHROPIC_API_KEY is not set: chat works, but agents will not reply");
+if (!checkClaudeAuth()) app.log.warn("claude CLI not found or not logged in (run `claude` once to sign in): chat works, but agents will not reply");

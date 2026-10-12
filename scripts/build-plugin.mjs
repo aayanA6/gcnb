@@ -19,7 +19,7 @@ cpSync(join(root, 'apps', 'web', 'dist'), join(root, 'dist', 'web'), { recursive
 // 2. Server -> dist/server/index.mjs. @gcnb/shared is a workspace TS package, so it gets bundled in;
 // only real npm deps are external (do NOT use --packages=external, which would externalize it too).
 const pkg = JSON.parse(readFileSync(join(root, 'apps', 'server', 'package.json'), 'utf8'))
-const EXTERNAL = ['better-sqlite3', '@anthropic-ai/claude-agent-sdk', 'fastify', 'ws', 'web-push', 'drizzle-orm', 'zod']
+const EXTERNAL = ['better-sqlite3', '@modelcontextprotocol/sdk', 'fastify', 'ws', 'web-push', 'drizzle-orm', 'zod']
 mkdirSync(join(root, 'dist', 'server'), { recursive: true })
 run('pnpm', [
   '--filter', '@gcnb/server', 'exec', 'esbuild', 'src/index.ts',

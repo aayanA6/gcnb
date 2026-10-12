@@ -5,9 +5,11 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ClientEvent, PERMISSION_MODES, noteFor, type ServerEvent } from '@gcnb/shared'
 import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
 import { openDb } from './db.ts'
 import { loadAgents, setAgentModel } from './agents.ts'
-import { AgentRuntime } from './runtime/agent.ts'
+import { AgentRuntime, checkClaudeAuth } from './runtime/agent.ts'
+import { registerMcp } from './mcp.ts'
 import { Router } from './router.ts'
 import { originAllowed, serveWeb } from './http.ts'
 import { Push } from './push.ts'
@@ -82,6 +84,11 @@ for (const a of db.pendingActions()) {
   db.patchMessageBody(JSON.parse(a.payloadJson).messageId, { status: 'expired' })
 }
 
+// Guards the MCP endpoint every contact's `claude` CLI process calls (hand_off, permission_prompt):
+// one random boot token, since the origin hook above only checks requests that carry an Origin header.
+const mcpToken = randomUUID()
+const mcpUrl = `http://127.0.0.1:${port}/mcp`
+
 const runtimes = new Map<string, AgentRuntime>()
 const router = new Router(db, runtimes, broadcast)
 for (const a of agentFiles)
@@ -91,8 +98,11 @@ for (const a of agentFiles)
       handOff: (from, d, to, message) => router.handOff(from, d, to, message),
       groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
       isGroup: (threadId) => threadId.startsWith('g-'),
+      mcpUrl,
+      mcpToken,
     }),
   )
+registerMcp(app, runtimes, mcpToken)
 
 // Starter group for the trio, so the planner -> coder -> reviewer hand-off chain works out of the box.
 const trio = ['planner', 'coder', 'reviewer']
@@ -269,4 +279,4 @@ process.on('SIGTERM', shutdown)
 await app.listen({ host: '127.0.0.1', port }) // never 0.0.0.0; use `tailscale serve` for the phone
 armIdleStop()
 if (!agentFiles.length) app.log.warn('no contacts: add agent files to .claude/agents/')
-if (!process.env.ANTHROPIC_API_KEY) app.log.warn('ANTHROPIC_API_KEY is not set: chat works, but agents will not reply')
+if (!checkClaudeAuth()) app.log.warn('claude CLI not found or not logged in (run `claude` once to sign in): chat works, but agents will not reply')

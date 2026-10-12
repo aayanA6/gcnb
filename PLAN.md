@@ -155,6 +155,69 @@ Not done yet:
 
 Deliberately deferred, per the plan: pick based on what you actually miss after using Phase 5.
 
+## Subscription runtime
+
+Replaced `@anthropic-ai/claude-agent-sdk` with driving the user's own `claude` CLI (v2.1.296+) as one
+long-lived headless subprocess per contact, so agents run on the Claude subscription instead of
+`ANTHROPIC_API_KEY`. No behavior change intended; same bubbles, grey tool lines, approval cards,
+question chips, hand-offs and spend tracking as Phases 1-5.
+
+What changed:
+- `apps/server/src/runtime/agent.ts`: `start()` now `spawn()`s `claude -p --input-format stream-json
+  --output-format stream-json --verbose --include-partial-messages --model <m> --permission-mode
+  <mode> [--resume <session_id>] --max-budget-usd <remaining> --agents <json> --agent <name>
+  --disallowedTools SendMessage ListAgents mcp__gcnb__permission_prompt --allowedTools
+  mcp__gcnb__hand_off --mcp-config <json> --permission-prompt-tool mcp__gcnb__permission_prompt`,
+  with `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` stripped from its env so the CLI can't silently
+  fall back to key billing. Stdin lines are `{"type":"user","message":{...}}`; interrupt sends a
+  `control_request`. stdout is parsed as stream-json and fed through the same `system/stream_event/
+  assistant/result` switch as before (the wire shapes are unchanged). `canUseTool` itself is
+  untouched — only its caller changed, from an in-process SDK callback to the MCP tool below.
+  Local types (`PermissionResult`, `PermissionUpdate`, `CanUseTool`) replace the SDK's.
+- `apps/server/src/mcp.ts` (new): a Streamable HTTP MCP endpoint at `/mcp/:contactId` on gcnb's own
+  Fastify server (stateless: a fresh MCP server + transport per request), guarded by one random boot
+  token as `Authorization: Bearer <token>` (the origin-check hook only looks at requests carrying an
+  Origin header, so this token is the real guard for the CLI's own requests). Serves `hand_off` (same
+  logic as the old in-process tool) and `permission_prompt` (delegates to the contact's `canUseTool`).
+  No `--strict-mcp-config`: this matches the SDK's old default (its `strictMcpConfig` was never set),
+  so the user's own project/user MCP servers still load alongside gcnb's.
+- `--permission-mode default` is still accepted by the CLI as an alias (confirmed live; its `--help`
+  only lists the newer `manual` name) — no mode remapping needed.
+- Boot-time gating: `checkClaudeAuth()` runs `claude auth status` once (bounded, 10s timeout, cached
+  for the process lifetime) in place of the `ANTHROPIC_API_KEY` checks in `state()`/the boot warning.
+- `@modelcontextprotocol/sdk` added as a direct dependency; `@anthropic-ai/claude-agent-sdk` dropped
+  from `apps/server/package.json` and from `scripts/build-plugin.mjs`'s `EXTERNAL` list (and its
+  generated `dist/server/package.json`).
+- README: auth section now documents signing in via `claude` once, `GCNB_CLAUDE_BIN`, and that no
+  `.env`/API key is required. `db.test.ts` only changed its `CanUseTool` import line.
+
+Verified:
+- A throwaway probe (a logging MCP server + one bounded live `claude -p` call against a Write tool,
+  deleted after) confirmed the exact args the CLI sends `--permission-prompt-tool`:
+  `{"tool_name":"Write","input":{...},"tool_use_id":"toolu_..."}` — **no `permission_suggestions`
+  field**. "Always allow" therefore builds its own session-only rule (`{type:'addRules',
+  rules:[{toolName}], behavior:'allow', destination:'session'}`) rather than relaying one from the CLI.
+- `pnpm -r typecheck`, `pnpm --filter @gcnb/server test` (unchanged `db.test.ts`, including the full
+  `canUseTool` → card → tapback → `PermissionResult` round trip), `pnpm build:plugin` +
+  `node --check dist/server/index.mjs`.
+- A bounded live run (`GCNB_PORT=8897`, temp `GCNB_DATA_DIR`, no `.env`, no `ANTHROPIC_API_KEY` in
+  env) over the real WebSocket protocol: snapshot reports all three contacts `live: true` (the new
+  `claude auth status` gate passing), a model switch persisted, and a DM to the reviewer got a real
+  reply on the subscription after running `Bash` (`echo hi`) — confirming the whole spawn → stdin →
+  stdout → reply pipeline works end to end on a live subscription session.
+
+Gaps:
+- The live run's own Bash call was pre-approved by this machine's local GateGuard PreToolUse hook
+  before gcnb's `permission_prompt` tool was reached, so the card → WS tapback → tool-runs round trip
+  wasn't independently observed against a *running* agent turn in this session. The underlying
+  mechanism was verified live and directly instead, via the probe above (real args round-tripped
+  through the same `permission_prompt` code path), plus the unchanged `db.test.ts` coverage of
+  `canUseTool` itself. Re-run the reviewer-approval smoke test in an environment without that hook to
+  see the card live.
+- `claude auth status`'s result is cached for the process lifetime; `claude auth login` after gcnb
+  has booted needs a restart to be picked up (same granularity as the old `ANTHROPIC_API_KEY` check,
+  which also only read the env once at boot).
+
 ## Decisions
 
 - Monthly API budget: not set. Per-contact cap defaults to $2 (`GCNB_BUDGET_USD`) on `sonnet`.
