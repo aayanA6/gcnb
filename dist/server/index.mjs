@@ -654,7 +654,10 @@ ${PERSONA}`,
       "--mcp-config",
       JSON.stringify(mcpConfig),
       "--permission-prompt-tool",
-      PERMISSION_PROMPT
+      PERMISSION_PROMPT,
+      // Skip ~/.claude settings by default: a global hook could answer tool prompts before gcnb's cards see them.
+      "--setting-sources",
+      process.env.GCNB_SETTING_SOURCES ?? "project,local"
     ];
     const child = spawn(CLAUDE_BIN, args, { cwd: c.cwd, env: cliEnv(), windowsHide: true });
     child.on("error", (err) => {
