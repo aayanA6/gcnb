@@ -45,13 +45,15 @@ export function useVoice(engine: Engine, onText: (text: string, send: boolean) =
       const r = new SR!()
       Object.assign(r, { continuous: true, interimResults: true, lang: navigator.language })
       let text = ''
+      let stopped = false // distinguishes "you pressed stop" from the engine timing out on its own
       r.onresult = (e) => {
         text = Array.from(e.results, (x) => x[0].transcript).join('')
         setRec((s) => s && { ...s, text })
       }
       r.onerror = (e) => e.error !== 'aborted' && e.error !== 'no-speech' && setError(`Mic: ${e.error}`)
-      r.onend = () => finish(text, mode)
-      stopRef.current = (send) => ((mode = send), send === null ? r.abort() : r.stop())
+      // A silence timeout ends recognition without you touching anything; don't throw away what you said.
+      r.onend = () => finish(text, stopped ? mode : false)
+      stopRef.current = (send) => ((stopped = true), (mode = send), send === null ? r.abort() : r.stop())
       r.start()
     } else {
       let stream: MediaStream

@@ -4,7 +4,10 @@ self.addEventListener('install', () => self.skipWaiting())
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()))
 
 self.addEventListener('push', (e) => {
-  const n = e.data ? e.data.json() : { title: 'gcnb', body: '' }
+  let n = { title: 'gcnb', body: '' }
+  try {
+    if (e.data) n = e.data.json()
+  } catch {}
   e.waitUntil(
     self.registration.showNotification(n.title, {
       body: n.body,
