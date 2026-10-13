@@ -66,6 +66,7 @@ export const Message = z.object({
       answers: z.record(z.string(), z.string()).optional(),
       handoff: z.object({ from: z.string(), to: z.string() }).optional(), // hand-off pill (contact ids)
       costUsd: z.number().optional(), // what the turn behind a group bubble cost
+      source: z.enum(['terminal']).optional(), // imported from a `claude --resume` turn run outside gcnb
     })
     .passthrough(),
   createdAt: z.number(), // epoch ms
@@ -90,6 +91,21 @@ export function noteFor(m: Message, nameOf: (contactId: string) => string, group
 }
 
 export const PERMISSION_MODES =['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const
+
+// POST /api/contacts: create a new contact (and its agent file) from gcnb itself. name mirrors
+// agents.ts's AgentFile name rule (it becomes a contact id, URL segment, agent filename and avatar name).
+export const CreateContact = z.object({
+  name: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+  displayName: z.string().trim().min(1).max(40),
+  description: z.string().min(1).max(2000),
+  instructions: z.string().min(1).max(20000),
+  model: z.string().regex(/^[\w.:-]{1,64}$/), // same regex as ClientEvent's updateContact
+  permissionMode: z.enum(PERMISSION_MODES),
+  budgetUsd: z.number().positive().max(10000).optional(),
+  color: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  cwd: z.string().min(1).max(500).optional(),
+})
+export type CreateContact = z.infer<typeof CreateContact>
 
 // Answering a card: approvals take a tapback, questions take answers keyed by question text.
 export const Decision = z.enum(['allow', 'always', 'deny'])
@@ -117,6 +133,7 @@ export const ClientEvent = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('answer'), actionId: z.string(), decision: Decision.optional(), answers: z.record(z.string(), z.string().max(5000)).optional() }),
   z.object({ type: z.literal('interrupt'), contactId: z.string() }), // stop button; also clears that contact's queue
+  z.object({ type: z.literal('handToTerminal'), contactId: z.string() }), // "Open in terminal": close so two writers don't run at once
   z.object({ type: z.literal('visible'), on: z.boolean() }), // tab shown/hidden: push only when no tab is looking
   z.object({
     type: z.literal('createGroup'),

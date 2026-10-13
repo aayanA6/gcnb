@@ -18,6 +18,7 @@ export const contacts = sqliteTable('contacts', {
   sessionId: text('session_id'),
   budgetUsd: real('budget_usd').notNull(),
   spentUsd: real('spent_usd').notNull(),
+  transcriptUuid: text('transcript_uuid'), // terminal continuity cursor: past this, gcnb hasn't shown it yet
 })
 
 export const threads = sqliteTable('threads', {
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, display_name TEXT NOT NULL, avatar_path TEXT,
   color TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, cwd TEXT NOT NULL,
   permission_mode TEXT NOT NULL DEFAULT 'default', session_id TEXT,
-  budget_usd REAL NOT NULL, spent_usd REAL NOT NULL DEFAULT 0
+  budget_usd REAL NOT NULL, spent_usd REAL NOT NULL DEFAULT 0, transcript_uuid TEXT
 );
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('dm','group')), title TEXT NOT NULL,
@@ -94,6 +95,9 @@ export function openDb(file: string) {
   const threadCols = (sqlite.prepare('PRAGMA table_info(threads)').all() as { name: string }[]).map((c) => c.name)
   if (!threadCols.includes('lead_contact_id')) sqlite.exec('ALTER TABLE threads ADD COLUMN lead_contact_id TEXT')
   if (!threadCols.includes('hourly_cap_usd')) sqlite.exec('ALTER TABLE threads ADD COLUMN hourly_cap_usd REAL')
+  // Subscription runtime added the terminal-continuity cursor; bring older databases up to date.
+  const contactCols = (sqlite.prepare('PRAGMA table_info(contacts)').all() as { name: string }[]).map((c) => c.name)
+  if (!contactCols.includes('transcript_uuid')) sqlite.exec('ALTER TABLE contacts ADD COLUMN transcript_uuid TEXT')
   const db = drizzle(sqlite)
 
   const toMessage = (r: typeof messages.$inferSelect): Message => ({
@@ -112,7 +116,7 @@ export function openDb(file: string) {
     // Inserts the contact and its DM thread once; later runs keep session_id and spend.
     seedContact(c: Omit<Contact, 'sessionId' | 'spentUsd'>, threadId: string) {
       db.transaction((tx) => {
-        tx.insert(contacts).values({ ...c, sessionId: null, spentUsd: 0 }).onConflictDoNothing().run()
+        tx.insert(contacts).values({ ...c, sessionId: null, spentUsd: 0, transcriptUuid: null }).onConflictDoNothing().run()
         tx.insert(threads).values({ id: threadId, kind: 'dm', title: c.displayName, createdAt: Date.now() }).onConflictDoNothing().run()
         tx.insert(threadMembers).values({ threadId, contactId: c.id }).onConflictDoNothing().run()
       })
@@ -122,6 +126,10 @@ export function openDb(file: string) {
     contact: (id: string): Contact | undefined => db.select().from(contacts).where(eq(contacts.id, id)).get(),
     updateContact: (id: string, patch: Partial<Omit<Contact, 'id' | 'agentName'>>) =>
       db.update(contacts).set(patch).where(eq(contacts.id, id)).run(),
+
+    // Terminal continuity cursor: kept off the shared Contact type (the web doesn't need it).
+    transcriptUuid: (id: string): string | null => db.select({ v: contacts.transcriptUuid }).from(contacts).where(eq(contacts.id, id)).get()?.v ?? null,
+    setTranscriptUuid: (id: string, uuid: string | null) => db.update(contacts).set({ transcriptUuid: uuid }).where(eq(contacts.id, id)).run(),
 
     threads(): Thread[] {
       const members = db.select().from(threadMembers).all()

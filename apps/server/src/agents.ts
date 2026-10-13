@@ -1,7 +1,7 @@
 // Contacts come from Claude Code's own subagent files (.claude/agents/*.md), so an agent defined
 // once works in both places. Looks (pfp, color, display name) live in gcnb's DB, never in these files.
 import { readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 export type AgentFile = {
   name: string
@@ -63,3 +63,20 @@ export function withModel(text: string, model: string): string {
 
 export const setAgentModel = (path: string, model: string) =>
   writeFileSync(path, withModel(readFileSync(path, 'utf8'), model))
+
+// Writes a brand-new contact's agent file in the same frontmatter format parseAgentFile reads back
+// (plan: "Create a contact from gcnb"). Newlines in description are flattened: frontmatter is line-based.
+export function agentFileText(a: { name: string; description: string; model?: string; permissionMode?: string; prompt: string }): string {
+  const fm = [`name: ${a.name}`, `description: ${a.description.replace(/\r?\n/g, ' ')}`]
+  if (a.model) fm.push(`model: ${a.model}`)
+  if (a.permissionMode) fm.push(`permissionMode: ${a.permissionMode}`)
+  return `---\n${fm.join('\n')}\n---\n${a.prompt}\n`
+}
+
+// Where a new contact's file would live; null if the name would escape the agents dir. Names are
+// already regex-checked by the caller (same rule as parseAgentFile's), so this is defense in depth,
+// the same pattern as avatar paths in index.ts.
+export function agentFilePath(dir: string, name: string): string | null {
+  const path = resolve(dir, `${name}.md`)
+  return path.startsWith(resolve(dir) + sep) ? path : null
+}

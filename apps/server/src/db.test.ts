@@ -5,11 +5,13 @@ import Database from 'better-sqlite3'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { writeFileSync, existsSync } from 'node:fs'
 import { openDb } from './db.ts'
-import { parseAgentFile, withModel } from './agents.ts'
+import { parseAgentFile, withModel, agentFileText, agentFilePath } from './agents.ts'
 import { AgentRuntime, describeTool, spendAfterResult, type CanUseTool } from './runtime/agent.ts'
 import { Router, type Deliverable, type Delivery } from './router.ts'
 import { originAllowed } from './http.ts'
+import { lastUuid, readSince } from './transcript.ts'
 import { noteFor, type Message } from '@gcnb/shared'
 
 const dir = mkdtempSync(join(tmpdir(), 'gcnb-'))
@@ -53,6 +55,29 @@ assert.equal(parseAgentFile('no frontmatter', 'z.md'), null)
 assert.equal(parseAgentFile(withModel(md, 'opus'), 'x.md')!.model, 'opus')
 assert.equal(parseAgentFile(withModel('---\nname: p\n---\nbody', 'haiku'), 'p.md')!.model, 'haiku')
 assert.equal(parseAgentFile(withModel(md, 'opus'), 'x.md')!.prompt, 'Be careful.')
+
+// Create a contact from gcnb: the written file round-trips through parseAgentFile, and the path
+// resolver rejects a traversal attempt and reports an existing file by returning null/the same path.
+{
+  const dir5 = mkdtempSync(join(tmpdir(), 'gcnb-'))
+  const text = agentFileText({ name: 'newbie', description: 'Tests things: thoroughly', model: 'sonnet', permissionMode: 'default', prompt: 'Be thorough.\nReport back.' })
+  const p = agentFilePath(dir5, 'newbie')!
+  writeFileSync(p, text)
+  const back = parseAgentFile(text, p)!
+  assert.equal(back.name, 'newbie')
+  assert.equal(back.description, 'Tests things: thoroughly')
+  assert.equal(back.model, 'sonnet')
+  assert.equal(back.permissionMode, 'default')
+  assert.equal(back.prompt, 'Be thorough.\nReport back.')
+  // A description with embedded newlines still round-trips (frontmatter is line-based).
+  const text2 = agentFileText({ name: 'x', description: 'line one\nline two', prompt: 'body' })
+  assert.equal(parseAgentFile(text2, 'x.md')!.description, 'line one line two')
+
+  assert.equal(agentFilePath(dir5, '../evil'), null) // escapes the agents dir
+  assert.ok(existsSync(p)) // duplicate check is the caller's job (existsSync(path)); the path itself is still valid
+  assert.equal(agentFilePath(dir5, 'newbie'), p)
+  rmSync(dir5, { recursive: true, force: true })
+}
 
 // Spend: resumed session reports a lifetime total vs. a fresh per-process total.
 assert.deepEqual(spendAfterResult(0.5, 0.7, null), { spent: 0.7, lifetime: true })
@@ -184,6 +209,52 @@ assert.deepEqual(spendAfterResult(0.5, 0.9, false), { spent: 1.4, lifetime: fals
   assert.deepEqual(migrated.threads().map((t) => [t.id, t.leadContactId, t.hourlyCapUsd]), [['dm-x', null, null]])
   migrated.close()
   rmSync(dir4, { recursive: true, force: true })
+}
+
+// Migration: a pre-"subscription runtime" database (contacts without transcript_uuid) opens and gains it.
+{
+  const dir5m = mkdtempSync(join(tmpdir(), 'gcnb-'))
+  const raw = new Database(join(dir5m, 'old.db'))
+  raw.exec(`CREATE TABLE contacts (
+    id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, display_name TEXT NOT NULL, avatar_path TEXT,
+    color TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, cwd TEXT NOT NULL,
+    permission_mode TEXT NOT NULL DEFAULT 'default', session_id TEXT,
+    budget_usd REAL NOT NULL, spent_usd REAL NOT NULL DEFAULT 0
+  );
+  INSERT INTO contacts (id, agent_name, display_name, color, model, cwd, budget_usd) VALUES ('x', 'x', 'X', '#000', 'sonnet', '/tmp', 2)`)
+  raw.close()
+  const migrated = openDb(join(dir5m, 'old.db'))
+  assert.equal(migrated.transcriptUuid('x'), null)
+  migrated.setTranscriptUuid('x', 'line-9')
+  assert.equal(migrated.transcriptUuid('x'), 'line-9')
+  migrated.close()
+  rmSync(dir5m, { recursive: true, force: true })
+}
+
+// Transcript parsing: a synthetic JSONL with a user string-content line, an assistant line mixing
+// text and tool_use blocks, a meta line, a text-less tool_result line and a garbage line; the parser
+// never throws, skips what it should, and an afterUuid cursor returns only what comes after it.
+{
+  const dir6 = mkdtempSync(join(tmpdir(), 'gcnb-'))
+  const path = join(dir6, 't.jsonl')
+  const lines = [
+    JSON.stringify({ uuid: 'u1', type: 'user', timestamp: 't1', message: { role: 'user', content: 'hello from the terminal' } }),
+    JSON.stringify({ uuid: 'u2', type: 'assistant', timestamp: 't2', message: { content: [{ type: 'text', text: 'sure, doing it' }, { type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } }),
+    JSON.stringify({ uuid: 'u3', type: 'user', isMeta: true, message: { content: 'meta bookkeeping' } }), // skipped: isMeta
+    JSON.stringify({ uuid: 'u4', type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } }), // skipped: no text block
+    'not valid json at all', // skipped: parser never throws
+    JSON.stringify({ uuid: 'u5', type: 'assistant', timestamp: 't5', message: { content: [{ type: 'text', text: 'done' }] } }),
+  ]
+  writeFileSync(path, `${lines.join('\n')}\n`)
+  assert.deepEqual(readSince(path, null).map((l) => [l.uuid, l.type, l.text]), [
+    ['u1', 'user', 'hello from the terminal'],
+    ['u2', 'assistant', 'sure, doing it'],
+    ['u5', 'assistant', 'done'],
+  ])
+  assert.deepEqual(readSince(path, 'u2').map((l) => l.uuid), ['u5']) // the cursor line itself doesn't come back
+  assert.equal(lastUuid(path), 'u5')
+  assert.equal(lastUuid(join(dir6, 'missing.jsonl')), null) // never throws on a missing file
+  rmSync(dir6, { recursive: true, force: true })
 }
 
 // originAllowed: same-origin loopback (including the vite dev proxy, which keeps the browser's Host

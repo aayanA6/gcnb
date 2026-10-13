@@ -3,11 +3,13 @@
 // stream-json out), so replies run on the user's Claude subscription instead of an API key.
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { watch } from 'node:fs'
 import { isAbsolute, relative } from 'node:path'
 import type { AgentState, Decision, Message, Question, ServerEvent } from '@gcnb/shared'
 import type { Db } from '../db.ts'
 import type { AgentFile } from '../agents.ts'
 import type { Delivery } from '../router.ts'
+import { lastUuid, readSince, transcriptPath } from '../transcript.ts'
 
 const PERSONA = [
   'You are chatting with the user through gcnb, an iMessage-style app. Reply like a text message: short, plain, conversational. Use markdown only when sharing code.',
@@ -167,6 +169,8 @@ export class AgentRuntime {
   private queue: Delivery[] = []
   private current?: Delivery & { startSpent: number }
   private pending = new Map<string, Pending>() // open canUseTool promises by action id
+  private watcher?: ReturnType<typeof watch>
+  private watchDebounce?: NodeJS.Timeout
   typing = false
 
   constructor(
@@ -175,7 +179,9 @@ export class AgentRuntime {
     private agent: AgentFile,
     private emit: (e: ServerEvent) => void,
     private hooks: RuntimeHooks,
-  ) {}
+  ) {
+    this.watchTranscript()
+  }
 
   get running() {
     return !!this.child
@@ -201,6 +207,7 @@ export class AgentRuntime {
 
   /** Queue a message for this contact's session. Caller checks state().live first. */
   deliver(d: Delivery) {
+    if (!this.current) this.importTerminal() // catch terminal turns since this contact was last live, before resuming it
     this.queue.push(d)
     this.pump()
   }
@@ -243,6 +250,7 @@ export class AgentRuntime {
   /** Server stop: drop the queue first so close() doesn't start anything new. */
   shutdown() {
     this.queue = []
+    this.watcher?.close()
     this.close()
   }
 
@@ -335,6 +343,44 @@ export class AgentRuntime {
     this.emit({ type: 'typing', contactId: this.contactId, threadId: this.threadId, on })
   }
 
+  // Transcript continuity: gcnb's own turns and a `claude --resume` run straight from a terminal share
+  // one transcript file. transcript_uuid is the cursor past everything gcnb has already shown (advanced
+  // on every `result`, above); readSince() only ever returns lines written outside gcnb.
+  private watchTranscript() {
+    this.watcher?.close()
+    this.watcher = undefined
+    const c = this.contact
+    if (!c.sessionId) return
+    try {
+      this.watcher = watch(transcriptPath(c.cwd, c.sessionId), () => {
+        if (this.current) return // gcnb itself is mid-turn and writing to it right now
+        clearTimeout(this.watchDebounce)
+        this.watchDebounce = setTimeout(() => this.importTerminal(), 300)
+      })
+    } catch {} // the file may not exist yet; importTerminal() also runs before every delivery and at boot
+  }
+
+  /** Pulls in lines written since transcript_uuid (terminal turns gcnb hasn't shown yet) as DM messages. */
+  importTerminal() {
+    const c = this.contact
+    if (!c.sessionId) return
+    const lines = readSince(transcriptPath(c.cwd, c.sessionId), this.db.transcriptUuid(this.contactId))
+    if (!lines.length) return
+    for (const l of lines) {
+      const message = this.db.addMessage({
+        threadId: `dm-${this.contactId}`,
+        sender: l.type === 'user' ? 'user' : 'agent',
+        contactId: l.type === 'user' ? null : this.contactId,
+        kind: 'text',
+        body: { text: l.text, source: 'terminal' },
+      })
+      this.emit({ type: 'message', message })
+    }
+    this.db.setTranscriptUuid(this.contactId, lines.at(-1)!.uuid)
+    // Someone else is driving the session from a terminal; respawn with --resume so the next delivery sees it.
+    if (this.running) this.close()
+  }
+
   private start() {
     const c = this.contact
     const box = inbox<CliUserMessage>()
@@ -415,6 +461,7 @@ export class AgentRuntime {
           if (typeof m.session_id === 'string' && m.session_id !== this.contact.sessionId) {
             this.db.updateContact(this.contactId, { sessionId: m.session_id })
             this.emit({ type: 'contact', contact: this.contact })
+            this.watchTranscript() // the transcript file's path depends on the session id
           }
           const group = this.hooks.isGroup(this.threadId)
           switch (m.type) {
@@ -439,6 +486,11 @@ export class AgentRuntime {
               lifetime = s.lifetime
               this.db.updateContact(this.contactId, { spentUsd: s.spent })
               this.emit({ type: 'contact', contact: this.contact })
+              // Advance the terminal-continuity cursor past everything gcnb itself just wrote this turn.
+              if (this.contact.sessionId) {
+                const last = lastUuid(transcriptPath(this.contact.cwd, this.contact.sessionId))
+                if (last) this.db.setTranscriptUuid(this.contactId, last)
+              }
               const cost = this.current ? Math.max(0, s.spent - this.current.startSpent) : 0
               if (group && m.subtype === 'success' && !m.is_error && (m.result as string).trim()) this.post('agent', 'text', (m.result as string).trim(), { costUsd: cost })
               if (group) this.hooks.groupTurnCost(this.threadId, cost)

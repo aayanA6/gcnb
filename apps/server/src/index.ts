@@ -3,11 +3,12 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ClientEvent, PERMISSION_MODES, noteFor, type ServerEvent } from '@gcnb/shared'
+import { ClientEvent, CreateContact, PERMISSION_MODES, noteFor, type ServerEvent } from '@gcnb/shared'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { openDb } from './db.ts'
-import { loadAgents, setAgentModel } from './agents.ts'
+import { loadAgents, setAgentModel, agentFilePath, agentFileText } from './agents.ts'
+import type { AgentFile } from './agents.ts'
 import { AgentRuntime, checkClaudeAuth } from './runtime/agent.ts'
 import { registerMcp } from './mcp.ts'
 import { Router } from './router.ts'
@@ -28,7 +29,8 @@ const STOP_AFTER_MIN = Number(process.env.GCNB_STOP_AFTER_MIN ?? 0) // 0 = keep 
 
 // Contacts = the agent files. New ones are seeded once; after that the DB owns looks, folder, budget, session.
 const COLORS = ['#ffd23f', '#3ddc97', '#ff6b4a', '#b9a5ff', '#5ce1ff']
-const agentFiles = loadAgents(process.env.GCNB_AGENTS_DIR ?? join(root, '.claude', 'agents'))
+const agentsDir = process.env.GCNB_AGENTS_DIR ?? join(root, '.claude', 'agents')
+const agentFiles = loadAgents(agentsDir)
 agentFiles.forEach((a, i) =>
   db.seedContact(
     {
@@ -91,17 +93,30 @@ const mcpUrl = `http://127.0.0.1:${port}/mcp`
 
 const runtimes = new Map<string, AgentRuntime>()
 const router = new Router(db, runtimes, broadcast)
-for (const a of agentFiles)
-  runtimes.set(
-    a.name,
-    new AgentRuntime(db, a.name, a, broadcast, {
-      handOff: (from, d, to, message) => router.handOff(from, d, to, message),
-      groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
-      isGroup: (threadId) => threadId.startsWith('g-'),
-      mcpUrl,
-      mcpToken,
-    }),
-  )
+
+// Shared by boot and POST /api/contacts, so a contact created from gcnb gets exactly the same runtime.
+function addRuntime(a: AgentFile) {
+  const rt = new AgentRuntime(db, a.name, a, broadcast, {
+    handOff: (from, d, to, message) => router.handOff(from, d, to, message),
+    groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
+    isGroup: (threadId) => threadId.startsWith('g-'),
+    mcpUrl,
+    mcpToken,
+  })
+  runtimes.set(a.name, rt)
+  rt.importTerminal() // the contact may already have a session from a previous run
+  return rt
+}
+
+// The manager (if there is one) leads #hq, a group of every contact; agents added later join it.
+function syncHq() {
+  if (!runtimes.has('manager')) return
+  const hq = db.threads().find((t) => t.kind === 'group' && t.title === 'hq')
+  if (hq) db.addMembers(hq.id, [...runtimes.keys()])
+  else db.createGroup({ title: 'hq', contactIds: [...runtimes.keys()], leadContactId: 'manager', hourlyCapUsd: GROUP_CAP })
+}
+
+for (const a of agentFiles) addRuntime(a)
 registerMcp(app, runtimes, mcpToken)
 
 // Starter group for the trio, so the planner -> coder -> reviewer hand-off chain works out of the box.
@@ -109,12 +124,7 @@ const trio = ['planner', 'coder', 'reviewer']
 if (trio.every((id) => runtimes.has(id)) && !db.threads().some((t) => t.kind === 'group'))
   db.createGroup({ title: 'launch crew', contactIds: trio, leadContactId: 'planner', hourlyCapUsd: GROUP_CAP })
 
-// The manager (if there is one) leads #hq, a group of every contact; agents added later join it on the next boot.
-if (runtimes.has('manager')) {
-  const hq = db.threads().find((t) => t.kind === 'group' && t.title === 'hq')
-  if (hq) db.addMembers(hq.id, [...runtimes.keys()])
-  else db.createGroup({ title: 'hq', contactIds: [...runtimes.keys()], leadContactId: 'manager', hourlyCapUsd: GROUP_CAP })
-}
+syncHq()
 
 // Only threads whose members all still have agent files show up; a deleted file hides them but keeps history.
 const visibleThreads = () => db.threads().filter((t) => t.contactIds.every((id) => runtimes.has(id)))
@@ -152,6 +162,7 @@ function handle(ev: ClientEvent, ws: WebSocket) {
     return
   }
   if (ev.type === 'interrupt') return void runtimes.get(ev.contactId)?.interrupt()
+  if (ev.type === 'handToTerminal') return void runtimes.get(ev.contactId)?.close() // so two writers don't run at once
 
   // updateContact
   const rt = runtimes.get(ev.contactId)
@@ -214,6 +225,39 @@ wss.on('connection', (ws) => {
 // Pfps. SVG is excluded on purpose: it can carry script.
 const IMAGE_TYPES: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }
 app.addContentTypeParser(Object.keys(IMAGE_TYPES), { parseAs: 'buffer' }, (_req, body, done) => done(null, body))
+
+// Create a contact from gcnb itself: write its agent file, seed it like boot does, and give it a
+// runtime, exactly as if it had been there since the server started (plan: "Create a contact from gcnb").
+app.post('/api/contacts', async (req, reply) => {
+  const parsed = CreateContact.safeParse(req.body)
+  if (!parsed.success) return reply.code(400).send({ error: 'bad contact', issues: parsed.error.issues })
+  const data = parsed.data
+  if (runtimes.has(data.name)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` })
+  const path = agentFilePath(agentsDir, data.name)
+  if (!path || existsSync(path)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` })
+  writeFileSync(path, agentFileText({ name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions }))
+  const a: AgentFile = { name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions, path }
+  db.seedContact(
+    {
+      id: a.name,
+      agentName: a.name,
+      displayName: data.displayName,
+      avatarPath: null,
+      color: data.color ?? COLORS[agentFiles.length % COLORS.length],
+      bio: data.description,
+      model: data.model,
+      cwd: data.cwd ? resolve(data.cwd) : resolve(process.env.GCNB_CWD ?? root),
+      permissionMode: data.permissionMode,
+      budgetUsd: data.budgetUsd ?? Number(process.env.GCNB_BUDGET_USD ?? 2),
+    },
+    `dm-${a.name}`,
+  )
+  agentFiles.push(a) // so a later model edit can find this file (see updateContact in handle())
+  addRuntime(a)
+  syncHq()
+  broadcast(snapshot()) // simplest way for every client to pick up the new contact, DM thread and #hq member
+  return db.contact(a.name)
+})
 
 app.post<{ Params: { id: string } }>('/api/contacts/:id/avatar', async (req, reply) => {
   const c = db.contact(req.params.id)
