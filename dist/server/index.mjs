@@ -1344,6 +1344,13 @@ app.post("/api/contacts", async (req, reply) => {
   if (runtimes.has(data.name)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
   const path = agentFilePath(agentsDir, data.name);
   if (!path || existsSync2(path)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
+  const cwd = data.cwd ? resolve3(data.cwd) : resolve3(process.env.GCNB_CWD ?? root);
+  let isDir = false;
+  try {
+    isDir = statSync2(cwd).isDirectory();
+  } catch {
+  }
+  if (!isDir) return reply.code(400).send({ error: `Folder not found: ${cwd}`, issues: [{ path: ["cwd"], message: `Folder not found: ${cwd}` }] });
   writeFileSync3(path, agentFileText({ name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions }));
   const a = { name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions, path };
   db.seedContact(
@@ -1355,7 +1362,7 @@ app.post("/api/contacts", async (req, reply) => {
       color: data.color ?? COLORS[agentFiles.length % COLORS.length],
       bio: data.description,
       model: data.model,
-      cwd: data.cwd ? resolve3(data.cwd) : resolve3(process.env.GCNB_CWD ?? root),
+      cwd,
       permissionMode: data.permissionMode,
       budgetUsd: data.budgetUsd ?? Number(process.env.GCNB_BUDGET_USD ?? 2)
     },
