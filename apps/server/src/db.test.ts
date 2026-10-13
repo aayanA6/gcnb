@@ -130,7 +130,7 @@ assert.deepEqual(spendAfterResult(0.5, 0.9, false), { spent: 1.4, lifetime: fals
 
   // No mention -> the lead; delivery is a prefixed user message into that member's own session.
   router.post(g.id, 'plan the websocket hub')
-  assert.equal(last('planner').text, '[#launch crew · from Aayan · members: planner, coder, reviewer] plan the websocket hub')
+  assert.equal(last('planner').text, '[#launch crew · from Aayan · lead: planner · members: planner, coder, reviewer] plan the websocket hub')
   assert.equal(last('planner').hops, 0)
   assert.equal(db3.recentMessages(g.id).at(-1)!.body.delivered, true)
   // @mentions by agent or display name, any case; @everyone hits all.

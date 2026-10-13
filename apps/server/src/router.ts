@@ -102,7 +102,8 @@ export class Router {
       this.line(t.id, contactId, msg)
       return msg
     }
-    rt.deliver({ threadId: t.id, text: `[#${t.title} · from ${from} · members: ${this.names(t)}] ${text}`, hops })
+    const lead = t.leadContactId ? ` · lead: ${this.db.contact(t.leadContactId)?.agentName ?? t.leadContactId}` : ''
+    rt.deliver({ threadId: t.id, text: `[#${t.title} · from ${from}${lead} · members: ${this.names(t)}] ${text}`, hops })
     return null
   }
 

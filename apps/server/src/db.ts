@@ -141,6 +141,9 @@ export function openDb(file: string) {
       })
       return this.thread(id)!
     },
+    addMembers(threadId: string, contactIds: string[]) {
+      for (const contactId of contactIds) db.insert(threadMembers).values({ threadId, contactId }).onConflictDoNothing().run()
+    },
     threadContactIds: (threadId: string) =>
       db.select().from(threadMembers).where(eq(threadMembers.threadId, threadId)).all().map((m) => m.contactId),
 

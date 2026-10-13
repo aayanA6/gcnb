@@ -109,6 +109,13 @@ const trio = ['planner', 'coder', 'reviewer']
 if (trio.every((id) => runtimes.has(id)) && !db.threads().some((t) => t.kind === 'group'))
   db.createGroup({ title: 'launch crew', contactIds: trio, leadContactId: 'planner', hourlyCapUsd: GROUP_CAP })
 
+// The manager (if there is one) leads #hq, a group of every contact; agents added later join it on the next boot.
+if (runtimes.has('manager')) {
+  const hq = db.threads().find((t) => t.kind === 'group' && t.title === 'hq')
+  if (hq) db.addMembers(hq.id, [...runtimes.keys()])
+  else db.createGroup({ title: 'hq', contactIds: [...runtimes.keys()], leadContactId: 'manager', hourlyCapUsd: GROUP_CAP })
+}
+
 // Only threads whose members all still have agent files show up; a deleted file hides them but keeps history.
 const visibleThreads = () => db.threads().filter((t) => t.contactIds.every((id) => runtimes.has(id)))
 
