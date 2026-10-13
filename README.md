@@ -115,6 +115,18 @@ pnpm typecheck
 
 Every `.claude/agents/*.md` file becomes a contact: the frontmatter supplies `name`, `description`, `model` and `tools`, and the body is the agent's instructions. The repo ships a planner, coder and reviewer. Pfps, display names, colors, folders and budgets live in gcnb's database. You edit them from the contact card on the right; click the pfp to upload a new one.
 
+### New contact
+
+**+ Contact** (next to + Group) opens a form: display name (auto-suggests a contact id, editable), role, instructions, model, working folder, "Before risky tools", a budget, a name color and an optional pfp. **Create** writes `.claude/agents/<id>.md` — the same file format as the shipped contacts, so it's usable outside gcnb too, e.g. `claude --agent <id>` — seeds it in the database and opens its DM.
+
+### Terminal hand-off
+
+**Open in terminal** (chat header or contact card) copies `claude --resume <session_id>` *and* tells gcnb to close its own process for that contact first, so the CLI is the only writer — gcnb steps aside instead of racing it for the same session. Turns you ran in the terminal show up in the DM tagged **in terminal** once you come back. Avoid typing to the same contact in both gcnb and a terminal at the same time; hand off instead of running them side by side.
+
+## Manager & #hq
+
+If a `manager.md` agent file exists, every contact is also a member of **#hq**, a group it leads: a post there with no `@mention` goes to the manager, who hands work to the right teammate with `hand_off`. Run the same agent outside gcnb with `claude --agent manager`.
+
 ## Group chat
 
 The server routes group chats; no model decides who gets a message:

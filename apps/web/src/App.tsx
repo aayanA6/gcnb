@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useReducer, useRef, useState, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
-import { HOP_LIMIT, PERMISSION_MODES, ServerEvent, noteFor, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread, type Typing } from '@gcnb/shared'
+import { CreateContact, HOP_LIMIT, PERMISSION_MODES, ServerEvent, noteFor, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread, type Typing } from '@gcnb/shared'
 import { applyTheme, themes } from './theme.ts'
 import { currentPings, enablePings, localNotify, onOpenThread, type Config, type Pings } from './pwa.ts'
 import { useVoice, voiceEngine, type Engine } from './voice.ts'
@@ -179,6 +179,7 @@ function Bubble({ m, showReceipt }: { m: Message; showReceipt: boolean }) {
       <div className={`bubble ${mine ? 'bg-me text-on-me' : 'bg-them text-on-them'}`} title={time(m.createdAt)}>
         {m.body.text}
       </div>
+      {m.body.source === 'terminal' && <div className="b-dashed mt-1 rounded-button px-2 py-0.5 text-[10px] text-muted">in terminal</div>}
       {mine && showReceipt && (
         <div className={`mt-1 text-[11px] ${m.body.delivered ? 'text-muted' : 'text-alert'}`}>
           {m.body.delivered ? 'Delivered' : 'Not delivered'}
@@ -433,20 +434,25 @@ function Composer({ name, mentions, disabled, engine, onSend, targetWindow = win
 }
 
 const MODELS = ['sonnet', 'opus', 'haiku']
+const CONTACT_COLORS = ['#ffd23f', '#3ddc97', '#ff6b4a', '#b9a5ff', '#5ce1ff'] // mirrors the server's own COLORS
+// A display name -> a contact id (same rule as CreateContact.name): lowercase, letters/digits/_/- only.
+const slugify = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64)
 
-// "Open in terminal": copies `claude --resume <id>` so the same session opens in the CLI.
-function CopyButton({ text, label, className = '' }: { text: string; label: string; className?: string }) {
+// "Open in terminal": copies `claude --resume <id>` so the same session opens in the CLI, and (when
+// `onHandOff` is given) tells the server to close its own process first, so the terminal is the only writer.
+function CopyButton({ text, label, className = '', onHandOff }: { text: string; label: string; className?: string; onHandOff?: () => void }) {
   const [copied, setCopied] = useState(false)
   return (
     <button
       title={text}
       className={`btn bg-panel px-3 py-1.5 text-sm text-ink ${className}`}
-      onClick={() =>
+      onClick={() => {
+        onHandOff?.()
         navigator.clipboard.writeText(text).then(() => {
           setCopied(true)
           setTimeout(() => setCopied(false), 1500)
         })
-      }
+      }}
     >
       {copied ? 'Copied resume command' : label}
     </button>
@@ -481,6 +487,19 @@ function Meter({ label, used, cap }: { label: string; used: number; cap: number 
   )
 }
 
+// The header's status pill. Clickable (and underlined) when it's reporting what the contact is up to
+// in another thread, so tapping it jumps straight there.
+function StatusPill({ status, tone, onClick }: { status: string; tone: string; onClick?: () => void }) {
+  const cls = `btn hidden shrink-0 px-3 py-1 text-xs sm:inline-block ${tone} ${onClick ? 'underline decoration-dotted underline-offset-2' : ''}`
+  return onClick ? (
+    <button className={cls} onClick={onClick}>
+      {status}
+    </button>
+  ) : (
+    <span className={cls}>{status}</span>
+  )
+}
+
 // Right-hand panels are always shown on wide screens; on a phone they open as a drawer from the ⓘ button.
 const drawer = (open: boolean) => `${open ? 'fixed inset-2 z-20 flex' : 'hidden'} lg:static lg:z-auto lg:flex`
 const CloseDrawer = ({ onClose }: { onClose: () => void }) => (
@@ -490,7 +509,7 @@ const CloseDrawer = ({ onClose }: { onClose: () => void }) => (
 )
 
 // Plan's contact card: pfp, bio, the three common edits on top, engine settings below.
-function ContactCard({ c, open, onClose, onSave }: { c: Contact; open: boolean; onClose: () => void; onSave: (patch: ContactPatch) => void }) {
+function ContactCard({ c, open, onClose, onSave, onHandOff }: { c: Contact; open: boolean; onClose: () => void; onSave: (patch: ContactPatch) => void; onHandOff: () => void }) {
   const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, budget: String(c.budgetUsd), permissionMode: c.permissionMode })
   const [error, setError] = useState('')
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm({ ...form, [k]: e.target.value })
@@ -568,7 +587,7 @@ function ContactCard({ c, open, onClose, onSave }: { c: Contact; open: boolean; 
       </form>
 
       <Meter label="Spent" used={c.spentUsd} cap={c.budgetUsd} />
-      {c.sessionId && <CopyButton text={resumeCommand(c)} label="Open in terminal" className="mt-auto w-full" />}
+      {c.sessionId && <CopyButton text={resumeCommand(c)} label="Open in terminal" className="mt-auto w-full" onHandOff={onHandOff} />}
     </aside>
   )
 }
@@ -642,6 +661,163 @@ function NewGroup({ contacts, onCreate, onCancel }: { contacts: Contact[]; onCre
           Create
         </button>
       </div>
+    </form>
+  )
+}
+
+type FieldIssues = Partial<Record<keyof CreateContact, string>>
+
+// "+ Contact": builds a CreateContact, validated client-side with the same shared zod schema the
+// server checks, and POSTs it. On success it uploads the pfp (if any) and opens the new DM.
+function NewContact({ defaultCwd, onCreate, onCancel }: { defaultCwd: string; onCreate: (c: Contact) => void; onCancel: () => void }) {
+  const [displayName, setDisplayName] = useState('')
+  const [name, setName] = useState('')
+  const [nameEdited, setNameEdited] = useState(false)
+  const [description, setDescription] = useState('')
+  const [instructions, setInstructions] = useState('')
+  const [model, setModel] = useState('sonnet')
+  const [cwd, setCwd] = useState('')
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>('default')
+  const [budget, setBudget] = useState('2')
+  const [color, setColor] = useState(CONTACT_COLORS[0])
+  const [avatar, setAvatar] = useState<File>()
+  const [serverError, setServerError] = useState('')
+  const [fieldIssues, setFieldIssues] = useState<FieldIssues>({})
+  const [busy, setBusy] = useState(false)
+
+  const slug = nameEdited ? name : slugify(displayName)
+  const parsed = CreateContact.safeParse({
+    name: slug,
+    displayName: displayName.trim(),
+    description: description.trim(),
+    instructions: instructions.trim(),
+    model,
+    permissionMode,
+    ...(Number(budget) > 0 ? { budgetUsd: Number(budget) } : {}),
+    color,
+    ...(cwd.trim() ? { cwd: cwd.trim() } : {}),
+  })
+
+  const submit = async () => {
+    if (!parsed.success || busy) return
+    setBusy(true)
+    setServerError('')
+    setFieldIssues({})
+    try {
+      const res = await fetch('/api/contacts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(parsed.data) })
+      const body = await res.json().catch(() => null)
+      if (!res.ok) {
+        if (Array.isArray(body?.issues)) setFieldIssues(Object.fromEntries(body.issues.map((i: { path: (string | number)[]; message: string }) => [i.path[0], i.message])))
+        setServerError(body?.error ?? `Create failed (${res.status})`)
+        return
+      }
+      if (avatar) await fetch(`/api/contacts/${encodeURIComponent(body.id)}/avatar`, { method: 'POST', headers: { 'content-type': avatar.type }, body: avatar }).catch(() => {})
+      onCreate(body)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form
+      className="field flex flex-col gap-2 p-3 text-sm"
+      onSubmit={(e) => {
+        e.preventDefault()
+        submit()
+      }}
+    >
+      <label className="flex flex-col gap-1 font-bold">
+        Display name
+        <input autoFocus value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="e.g. Ada" maxLength={40} className="field px-2 py-1 font-normal" />
+      </label>
+      <label className="flex flex-col gap-1 font-bold">
+        Contact id
+        <input
+          value={slug}
+          onChange={(e) => {
+            setNameEdited(true)
+            setName(slugify(e.target.value))
+          }}
+          placeholder="auto-suggested from the name"
+          aria-invalid={!!fieldIssues.name}
+          className="field px-2 py-1 font-mono font-normal"
+        />
+        {fieldIssues.name && <span className="text-xs font-normal text-alert">{fieldIssues.name}</span>}
+      </label>
+      <label className="flex flex-col gap-1 font-bold">
+        Role / description
+        <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What this contact is for" maxLength={2000} className="field px-2 py-1 font-normal" />
+      </label>
+      <label className="flex flex-col gap-1 font-bold">
+        Instructions
+        <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} rows={4} placeholder="System prompt" className="field px-2 py-1 font-normal" />
+      </label>
+      <label className="flex flex-col gap-1 font-bold">
+        Model
+        <select value={model} onChange={(e) => setModel(e.target.value)} className="field px-2 py-1 font-normal">
+          {MODELS.map((m) => (
+            <option key={m}>{m}</option>
+          ))}
+        </select>
+      </label>
+      <label className="flex flex-col gap-1 font-bold">
+        Working folder
+        <input value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder={defaultCwd || 'same as other contacts'} className="field px-2 py-1 font-mono font-normal" />
+      </label>
+      <fieldset className="flex flex-col gap-1">
+        <legend className="font-bold">Before risky tools</legend>
+        <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Before risky tools">
+          {PERMISSION_MODES.map((p) => (
+            <button
+              key={p}
+              type="button"
+              role="radio"
+              aria-checked={permissionMode === p}
+              onClick={() => setPermissionMode(p)}
+              className={`btn px-2.5 py-1 text-xs ${permissionMode === p ? 'bg-accent text-on-accent' : 'bg-panel text-ink'}`}
+            >
+              {PERMISSION_LABELS[p]}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+      <label className="flex flex-col gap-1 font-bold">
+        Budget (USD)
+        <input type="number" min="0.01" step="0.5" value={budget} onChange={(e) => setBudget(e.target.value)} className="field px-2 py-1 font-normal" />
+      </label>
+      <fieldset className="flex flex-col gap-1">
+        <legend className="font-bold">Color</legend>
+        <div className="flex gap-1.5" role="radiogroup" aria-label="Name color">
+          {CONTACT_COLORS.map((hex) => (
+            <button
+              key={hex}
+              type="button"
+              role="radio"
+              aria-checked={color === hex}
+              aria-label={hex}
+              onClick={() => setColor(hex)}
+              className="btn size-7 rounded-full"
+              style={{ background: hex, boxShadow: color === hex ? '0 0 0 3px var(--colors-ink)' : undefined }}
+            />
+          ))}
+        </div>
+      </fieldset>
+      <label className="flex flex-col gap-1 font-bold">
+        Pfp (optional)
+        <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(e) => setAvatar(e.target.files?.[0])} className="text-xs font-normal" />
+      </label>
+      {serverError && <div className="bg-alert px-3 py-1 text-xs font-bold text-on-alert">{serverError}</div>}
+      <div className="flex gap-2">
+        <button type="button" onClick={onCancel} className="btn flex-1 bg-panel py-1 text-ink">
+          Cancel
+        </button>
+        <button type="submit" disabled={!parsed.success || busy} className="btn flex-1 bg-me py-1 text-on-me">
+          {busy ? 'Creating…' : 'Create'}
+        </button>
+      </div>
+      <p className="text-xs text-muted">
+        Also creates <code className="font-mono">.claude/agents/{slug || '<name>'}.md</code>, usable in Claude Code (<code className="font-mono">claude --agent {slug || '<name>'}</code>).
+      </p>
     </form>
   )
 }
@@ -744,6 +920,7 @@ export default function App() {
   const [threadId, setThreadId] = useState<string | null>(initialDeepLinkThread)
   const [view, setView] = useState<'list' | 'chat'>(() => (threadId ? 'chat' : 'list'))
   const [creating, setCreating] = useState(false)
+  const [creatingContact, setCreatingContact] = useState(false)
   const [infoOpen, setInfoOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'groups' | 'needs'>('all')
@@ -804,6 +981,22 @@ export default function App() {
   const isOpenCard = (m: Message) => (m.kind === 'approval' || m.kind === 'question') && m.body.status === 'pending'
   const threadNeedsYou = (tid: string) => state.messages.some((m) => m.threadId === tid && isOpenCard(m))
   const waiting = !!thread && threadNeedsYou(thread.id)
+
+  // "What they're up to": a DM's contact may also be busy in a group. Surface the newest sign of that —
+  // an open card, a typing turn, or (within 10 minutes) its latest tool/agent line — instead of "Online".
+  const ACTIVITY_WINDOW_MS = 10 * 60_000
+  const activityOf = (c: Contact, excludeThreadId: string) => {
+    const label = (t: Thread) => (t.kind === 'group' ? `#${t.title}` : t.title)
+    const others = state.threads.filter((t) => t.id !== excludeThreadId && t.contactIds.includes(c.id))
+    for (const t of others) if (state.messages.some((m) => m.threadId === t.id && m.contactId === c.id && isOpenCard(m))) return { thread: t, text: `Needs you in ${label(t)}`, needsYou: true }
+    for (const t of others) if (typingIn(t.id).includes(c.id)) return { thread: t, text: `Working in ${label(t)}`, needsYou: false }
+    let best: { thread: Thread; m: Message } | undefined
+    for (const t of others) {
+      const m = state.messages.findLast((m) => m.threadId === t.id && m.contactId === c.id && Date.now() - m.createdAt < ACTIVITY_WINDOW_MS && (m.kind === 'tool' || (m.sender === 'agent' && m.kind === 'text')))
+      if (m && (!best || m.createdAt > best.m.createdAt)) best = { thread: t, m }
+    }
+    return best ? { thread: best.thread, text: `Working in ${label(best.thread)} · ${best.m.body.text}`, needsYou: false } : null
+  }
   const statusOf = (c: Contact) =>
     messages.some((m) => m.contactId === c.id && isOpenCard(m)) ? 'Needs you' : typers.includes(c) ? 'Typing' : 'Idle'
   const busy = members.filter((c) => statusOf(c) !== 'Idle')
@@ -836,6 +1029,7 @@ export default function App() {
   const pipMessages = state.messages.filter((m) => m.threadId === pipThread?.id)
   const pipLastUserId = pipMessages.findLast((m) => m.sender === 'user')?.id
   const pipTypers = pipThread ? membersOf(pipThread).filter((c) => typingIn(pipThread.id).includes(c.id)) : []
+  const pipOtherAct = pipContact && pipThread && !pipTypers.length && !threadNeedsYou(pipThread.id) ? activityOf(pipContact, pipThread.id) : null
 
   // The PiP's open thread counts as "on screen" for unread purposes whenever the PiP is open and
   // showing it, same idea as `chatOnScreen` above but independent of this tab's own visibility.
@@ -895,6 +1089,7 @@ export default function App() {
     pip.open()
   }
 
+  const otherAct = contact && thread && !waiting && !typers.length ? activityOf(contact, thread.id) : null
   const status = !state.connected
     ? 'Reconnecting…'
     : waiting
@@ -903,12 +1098,20 @@ export default function App() {
         ? isGroup
           ? `${typers.map((c) => c.displayName).join(', ')} typing…`
           : 'Typing…'
-        : isGroup
-          ? 'Idle'
-          : agent?.live
-            ? 'Online'
-            : 'Offline'
-  const statusTone = waiting ? 'bg-accent text-on-accent' : !state.connected || (!isGroup && !agent?.live) ? 'bg-alert text-on-alert' : 'bg-ok text-on-accent'
+        : otherAct
+          ? otherAct.text
+          : isGroup
+            ? 'Idle'
+            : agent?.live
+              ? 'Online'
+              : 'Offline'
+  const statusTone = waiting
+    ? 'bg-accent text-on-accent'
+    : !state.connected || (!isGroup && !agent?.live)
+      ? 'bg-alert text-on-alert'
+      : otherAct?.needsYou
+        ? 'bg-alert text-on-alert'
+        : 'bg-ok text-on-accent'
 
   const preview = (t: Thread) => {
     if (threadNeedsYou(t.id)) return <b>Needs you</b>
@@ -985,11 +1188,38 @@ export default function App() {
                 <Icon d="popout" />
               </button>
             )}
-            <button className="btn bg-accent px-2.5 py-1 text-sm text-on-accent" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+            <button
+              className="btn bg-panel px-2.5 py-1 text-sm text-ink"
+              onClick={() => {
+                setCreatingContact(!creatingContact)
+                setCreating(false)
+              }}
+              aria-expanded={creatingContact}
+            >
+              + Contact
+            </button>
+            <button
+              className="btn bg-accent px-2.5 py-1 text-sm text-on-accent"
+              onClick={() => {
+                setCreating(!creating)
+                setCreatingContact(false)
+              }}
+              aria-expanded={creating}
+            >
               + Group
             </button>
           </div>
         </div>
+        {creatingContact && (
+          <NewContact
+            defaultCwd={state.contacts[0]?.cwd ?? ''}
+            onCancel={() => setCreatingContact(false)}
+            onCreate={(c) => {
+              setCreatingContact(false)
+              selectThread(`dm-${c.id}`)
+            }}
+          />
+        )}
         {creating && (
           <NewGroup
             contacts={state.contacts}
@@ -1094,8 +1324,15 @@ export default function App() {
                   )}
                 </div>
               </div>
-              <span className={`btn hidden shrink-0 px-3 py-1 text-xs sm:inline-block ${statusTone}`}>{status}</span>
-              {contact?.sessionId && <CopyButton text={resumeCommand(contact)} label="Open in terminal" className="hidden sm:block" />}
+              <StatusPill status={status} tone={statusTone} onClick={otherAct ? () => selectThread(otherAct.thread.id) : undefined} />
+              {contact?.sessionId && (
+                <CopyButton
+                  text={resumeCommand(contact)}
+                  label="Open in terminal"
+                  className="hidden sm:block"
+                  onHandOff={() => emit({ type: 'handToTerminal', contactId: contact.id })}
+                />
+              )}
               {busy.length > 0 && (
                 <button className="btn shrink-0 bg-alert px-3 py-1.5 text-sm text-on-alert" onClick={() => busy.forEach((c) => emit({ type: 'interrupt', contactId: c.id }))}>
                   {isGroup ? '❚❚ Pause all' : '■ Stop'}
@@ -1148,6 +1385,7 @@ export default function App() {
           open={infoOpen}
           onClose={() => setInfoOpen(false)}
           onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })}
+          onHandOff={() => emit({ type: 'handToTerminal', contactId: contact.id })}
         />
       )}
 
@@ -1163,7 +1401,9 @@ export default function App() {
                   {pipContact ? <Avatar c={pipContact} size="size-8" /> : <Stack cs={pipMembers} size="size-6 text-[9px]" />}
                   <div className="min-w-0 flex-1">
                     <div className="title-type truncate text-sm font-bold">{pipContact ? pipContact.displayName : `#${pipThread.title}`}</div>
-                    <div className="truncate text-xs text-muted">{threadNeedsYou(pipThread.id) ? 'Waiting on you' : pipTypers.length ? 'Typing…' : (pipContact?.agentName ?? 'group')}</div>
+                    <div className="truncate text-xs text-muted">
+                      {threadNeedsYou(pipThread.id) ? 'Waiting on you' : pipTypers.length ? 'Typing…' : (pipOtherAct?.text ?? pipContact?.agentName ?? 'group')}
+                    </div>
                   </div>
                   <button aria-label="Expand to full window" title="Expand" onClick={() => (window.focus(), pip.close())} className="btn shrink-0 bg-panel px-3 py-1.5 text-sm text-ink">
                     Expand

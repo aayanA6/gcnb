@@ -1,8 +1,8 @@
 // src/index.ts
 import Fastify from "fastify";
 import { WebSocketServer, WebSocket } from "ws";
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync4, statSync as statSync2, writeFileSync as writeFileSync3, rmSync, readdirSync as readdirSync2 } from "node:fs";
-import { join as join4, resolve as resolve2 } from "node:path";
+import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync5, statSync as statSync2, writeFileSync as writeFileSync3, rmSync, readdirSync as readdirSync2 } from "node:fs";
+import { join as join5, resolve as resolve3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ../../packages/shared/src/index.ts
@@ -63,8 +63,10 @@ var Message = z.object({
     answers: z.record(z.string(), z.string()).optional(),
     handoff: z.object({ from: z.string(), to: z.string() }).optional(),
     // hand-off pill (contact ids)
-    costUsd: z.number().optional()
+    costUsd: z.number().optional(),
     // what the turn behind a group bubble cost
+    source: z.enum(["terminal"]).optional()
+    // imported from a `claude --resume` turn run outside gcnb
   }).passthrough(),
   createdAt: z.number()
   // epoch ms
@@ -81,6 +83,18 @@ function noteFor(m, nameOf, groupTitle) {
   return null;
 }
 var PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"];
+var CreateContact = z.object({
+  name: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+  displayName: z.string().trim().min(1).max(40),
+  description: z.string().min(1).max(2e3),
+  instructions: z.string().min(1).max(2e4),
+  model: z.string().regex(/^[\w.:-]{1,64}$/),
+  // same regex as ClientEvent's updateContact
+  permissionMode: z.enum(PERMISSION_MODES),
+  budgetUsd: z.number().positive().max(1e4).optional(),
+  color: z.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+  cwd: z.string().min(1).max(500).optional()
+});
 var Decision = z.enum(["allow", "always", "deny"]);
 var AgentState = z.object({
   contactId: z.string(),
@@ -103,6 +117,8 @@ var ClientEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("answer"), actionId: z.string(), decision: Decision.optional(), answers: z.record(z.string(), z.string().max(5e3)).optional() }),
   z.object({ type: z.literal("interrupt"), contactId: z.string() }),
   // stop button; also clears that contact's queue
+  z.object({ type: z.literal("handToTerminal"), contactId: z.string() }),
+  // "Open in terminal": close so two writers don't run at once
   z.object({ type: z.literal("visible"), on: z.boolean() }),
   // tab shown/hidden: push only when no tab is looking
   z.object({
@@ -152,7 +168,9 @@ var contacts = sqliteTable("contacts", {
   permissionMode: text("permission_mode").notNull(),
   sessionId: text("session_id"),
   budgetUsd: real("budget_usd").notNull(),
-  spentUsd: real("spent_usd").notNull()
+  spentUsd: real("spent_usd").notNull(),
+  transcriptUuid: text("transcript_uuid")
+  // terminal continuity cursor: past this, gcnb hasn't shown it yet
 });
 var threads = sqliteTable("threads", {
   id: text("id").primaryKey(),
@@ -189,7 +207,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, display_name TEXT NOT NULL, avatar_path TEXT,
   color TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, cwd TEXT NOT NULL,
   permission_mode TEXT NOT NULL DEFAULT 'default', session_id TEXT,
-  budget_usd REAL NOT NULL, spent_usd REAL NOT NULL DEFAULT 0
+  budget_usd REAL NOT NULL, spent_usd REAL NOT NULL DEFAULT 0, transcript_uuid TEXT
 );
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('dm','group')), title TEXT NOT NULL,
@@ -220,6 +238,8 @@ function openDb(file) {
   const threadCols = sqlite.prepare("PRAGMA table_info(threads)").all().map((c) => c.name);
   if (!threadCols.includes("lead_contact_id")) sqlite.exec("ALTER TABLE threads ADD COLUMN lead_contact_id TEXT");
   if (!threadCols.includes("hourly_cap_usd")) sqlite.exec("ALTER TABLE threads ADD COLUMN hourly_cap_usd REAL");
+  const contactCols = sqlite.prepare("PRAGMA table_info(contacts)").all().map((c) => c.name);
+  if (!contactCols.includes("transcript_uuid")) sqlite.exec("ALTER TABLE contacts ADD COLUMN transcript_uuid TEXT");
   const db2 = drizzle(sqlite);
   const toMessage = (r) => ({
     id: r.id,
@@ -235,7 +255,7 @@ function openDb(file) {
     // Inserts the contact and its DM thread once; later runs keep session_id and spend.
     seedContact(c, threadId) {
       db2.transaction((tx) => {
-        tx.insert(contacts).values({ ...c, sessionId: null, spentUsd: 0 }).onConflictDoNothing().run();
+        tx.insert(contacts).values({ ...c, sessionId: null, spentUsd: 0, transcriptUuid: null }).onConflictDoNothing().run();
         tx.insert(threads).values({ id: threadId, kind: "dm", title: c.displayName, createdAt: Date.now() }).onConflictDoNothing().run();
         tx.insert(threadMembers).values({ threadId, contactId: c.id }).onConflictDoNothing().run();
       });
@@ -243,6 +263,9 @@ function openDb(file) {
     contacts: () => db2.select().from(contacts).all(),
     contact: (id) => db2.select().from(contacts).where(eq(contacts.id, id)).get(),
     updateContact: (id, patch) => db2.update(contacts).set(patch).where(eq(contacts.id, id)).run(),
+    // Terminal continuity cursor: kept off the shared Contact type (the web doesn't need it).
+    transcriptUuid: (id) => db2.select({ v: contacts.transcriptUuid }).from(contacts).where(eq(contacts.id, id)).get()?.v ?? null,
+    setTranscriptUuid: (id, uuid) => db2.update(contacts).set({ transcriptUuid: uuid }).where(eq(contacts.id, id)).run(),
     threads() {
       const members = db2.select().from(threadMembers).all();
       return db2.select().from(threads).all().map((t) => ({
@@ -260,6 +283,9 @@ function openDb(file) {
         for (const contactId of g.contactIds) tx.insert(threadMembers).values({ threadId: id, contactId }).run();
       });
       return this.thread(id);
+    },
+    addMembers(threadId, contactIds) {
+      for (const contactId of contactIds) db2.insert(threadMembers).values({ threadId, contactId }).onConflictDoNothing().run();
     },
     threadContactIds: (threadId) => db2.select().from(threadMembers).where(eq(threadMembers.threadId, threadId)).all().map((m) => m.contactId),
     addMessage(m) {
@@ -290,7 +316,7 @@ function openDb(file) {
 
 // src/agents.ts
 import { readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 var FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 function parseAgentFile(text2, path) {
   const m = FRONTMATTER.exec(text2);
@@ -333,15 +359,89 @@ ${lines.join("\n")}
 ${m[2]}`;
 }
 var setAgentModel = (path, model) => writeFileSync(path, withModel(readFileSync(path, "utf8"), model));
+function agentFileText(a) {
+  const fm = [`name: ${a.name}`, `description: ${a.description.replace(/\r?\n/g, " ")}`];
+  if (a.model) fm.push(`model: ${a.model}`);
+  if (a.permissionMode) fm.push(`permissionMode: ${a.permissionMode}`);
+  return `---
+${fm.join("\n")}
+---
+${a.prompt}
+`;
+}
+function agentFilePath(dir, name) {
+  const path = resolve(dir, `${name}.md`);
+  return path.startsWith(resolve(dir) + sep) ? path : null;
+}
 
 // src/runtime/agent.ts
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
+import { watch } from "node:fs";
 import { isAbsolute, relative } from "node:path";
+
+// src/transcript.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+import { homedir } from "node:os";
+import { join as join2 } from "node:path";
+function transcriptPath(cwd, sessionId) {
+  const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  return join2(homedir(), ".claude", "projects", slug, `${sessionId}.jsonl`);
+}
+function readLines(path) {
+  try {
+    return readFileSync2(path, "utf8").split("\n").filter((l) => l.trim());
+  } catch {
+    return [];
+  }
+}
+function textOf(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content.filter((b) => !!b && typeof b === "object" && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n").trim();
+}
+function lastUuid(path) {
+  const lines = readLines(path);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const uuid = JSON.parse(lines[i]).uuid;
+      if (typeof uuid === "string") return uuid;
+    } catch {
+    }
+  }
+  return null;
+}
+function readSince(path, afterUuid) {
+  const out = [];
+  let seen = !afterUuid;
+  for (const line of readLines(path)) {
+    let m;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const uuid = typeof m.uuid === "string" ? m.uuid : void 0;
+    if (!seen) {
+      if (uuid === afterUuid) seen = true;
+      continue;
+    }
+    if (m.isSidechain || m.isMeta) continue;
+    const type = m.type;
+    if (type !== "user" && type !== "assistant") continue;
+    const text2 = textOf(m.message?.content);
+    if (!text2 || !uuid) continue;
+    out.push({ uuid, type, timestamp: String(m.timestamp ?? ""), text: text2 });
+  }
+  return out;
+}
+
+// src/runtime/agent.ts
 var PERSONA = [
   "You are chatting with the user through gcnb, an iMessage-style app. Reply like a text message: short, plain, conversational. Use markdown only when sharing code.",
-  'Group chat messages arrive prefixed like "[#group \xB7 from Name \xB7 members: a, b]". Your final reply in that turn posts to the group.',
-  "To pass work to another member of that group, call the hand_off tool with their name and a self-contained message; the server delivers it and their reply posts to the group. Only hand off when someone else should act next."
+  'Group chat messages arrive prefixed like "[#group \xB7 from Name \xB7 lead: x \xB7 members: a, b]". Your final reply in that turn posts to the group.',
+  "To pass work to another member of that group, call the hand_off tool with their name and a self-contained message; the server delivers it and their reply posts to the group. Only hand off when someone else should act next.",
+  "The group lead (named in the prefix) runs the team: if the lead gave you a task and it is not you, finish it and hand_off your result to the lead. The lead reports to the user."
 ].join("\n");
 var HAND_OFF = "mcp__gcnb__hand_off";
 var PERMISSION_PROMPT = "mcp__gcnb__permission_prompt";
@@ -447,6 +547,7 @@ var AgentRuntime = class {
     this.agent = agent;
     this.emit = emit;
     this.hooks = hooks;
+    this.watchTranscript();
   }
   db;
   contactId;
@@ -463,6 +564,8 @@ var AgentRuntime = class {
   current;
   pending = /* @__PURE__ */ new Map();
   // open canUseTool promises by action id
+  watcher;
+  watchDebounce;
   typing = false;
   get running() {
     return !!this.child;
@@ -484,6 +587,7 @@ var AgentRuntime = class {
   }
   /** Queue a message for this contact's session. Caller checks state().live first. */
   deliver(d) {
+    if (!this.current) this.importTerminal();
     this.queue.push(d);
     this.pump();
   }
@@ -523,6 +627,7 @@ var AgentRuntime = class {
   /** Server stop: drop the queue first so close() doesn't start anything new. */
   shutdown() {
     this.queue = [];
+    this.watcher?.close();
     this.close();
   }
   /** CLI args are fixed per process: close now (or after the current turn) and resume with new options on the next message. */
@@ -580,8 +685,8 @@ var AgentRuntime = class {
     });
     this.setTyping(false);
     this.emit({ type: "message", message });
-    return new Promise((resolve3) => {
-      this.pending.set(actionId, { resolve: resolve3, messageId: message.id, input, suggestions: opts.suggestions });
+    return new Promise((resolve4) => {
+      this.pending.set(actionId, { resolve: resolve4, messageId: message.id, input, suggestions: opts.suggestions });
       opts.signal.addEventListener("abort", () => this.settle(actionId, "cancelled", { behavior: "deny", message: "Cancelled." }), { once: true });
     });
   };
@@ -603,6 +708,42 @@ var AgentRuntime = class {
     if (this.typing === on) return;
     this.typing = on;
     this.emit({ type: "typing", contactId: this.contactId, threadId: this.threadId, on });
+  }
+  // Transcript continuity: gcnb's own turns and a `claude --resume` run straight from a terminal share
+  // one transcript file. transcript_uuid is the cursor past everything gcnb has already shown (advanced
+  // on every `result`, above); readSince() only ever returns lines written outside gcnb.
+  watchTranscript() {
+    this.watcher?.close();
+    this.watcher = void 0;
+    const c = this.contact;
+    if (!c.sessionId) return;
+    try {
+      this.watcher = watch(transcriptPath(c.cwd, c.sessionId), () => {
+        if (this.current) return;
+        clearTimeout(this.watchDebounce);
+        this.watchDebounce = setTimeout(() => this.importTerminal(), 300);
+      });
+    } catch {
+    }
+  }
+  /** Pulls in lines written since transcript_uuid (terminal turns gcnb hasn't shown yet) as DM messages. */
+  importTerminal() {
+    const c = this.contact;
+    if (!c.sessionId) return;
+    const lines = readSince(transcriptPath(c.cwd, c.sessionId), this.db.transcriptUuid(this.contactId));
+    if (!lines.length) return;
+    for (const l of lines) {
+      const message = this.db.addMessage({
+        threadId: `dm-${this.contactId}`,
+        sender: l.type === "user" ? "user" : "agent",
+        contactId: l.type === "user" ? null : this.contactId,
+        kind: "text",
+        body: { text: l.text, source: "terminal" }
+      });
+      this.emit({ type: "message", message });
+    }
+    this.db.setTranscriptUuid(this.contactId, lines.at(-1).uuid);
+    if (this.running) this.close();
   }
   start() {
     const c = this.contact;
@@ -703,6 +844,7 @@ ${PERSONA}`,
           if (typeof m.session_id === "string" && m.session_id !== this.contact.sessionId) {
             this.db.updateContact(this.contactId, { sessionId: m.session_id });
             this.emit({ type: "contact", contact: this.contact });
+            this.watchTranscript();
           }
           const group = this.hooks.isGroup(this.threadId);
           switch (m.type) {
@@ -724,6 +866,10 @@ ${PERSONA}`,
               lifetime = s.lifetime;
               this.db.updateContact(this.contactId, { spentUsd: s.spent });
               this.emit({ type: "contact", contact: this.contact });
+              if (this.contact.sessionId) {
+                const last = lastUuid(transcriptPath(this.contact.cwd, this.contact.sessionId));
+                if (last) this.db.setTranscriptUuid(this.contactId, last);
+              }
               const cost = this.current ? Math.max(0, s.spent - this.current.startSpent) : 0;
               if (group && m.subtype === "success" && !m.is_error && m.result.trim()) this.post("agent", "text", m.result.trim(), { costUsd: cost });
               if (group) this.hooks.groupTurnCost(this.threadId, cost);
@@ -907,7 +1053,8 @@ var Router = class {
       this.line(t.id, contactId, msg);
       return msg;
     }
-    rt.deliver({ threadId: t.id, text: `[#${t.title} \xB7 from ${from} \xB7 members: ${this.names(t)}] ${text2}`, hops });
+    const lead = t.leadContactId ? ` \xB7 lead: ${this.db.contact(t.leadContactId)?.agentName ?? t.leadContactId}` : "";
+    rt.deliver({ threadId: t.id, text: `[#${t.title} \xB7 from ${from}${lead} \xB7 members: ${this.names(t)}] ${text2}`, hops });
     return null;
   }
   names(t) {
@@ -928,8 +1075,8 @@ var Router = class {
 };
 
 // src/http.ts
-import { readFileSync as readFileSync2, statSync } from "node:fs";
-import { extname, join as join2, resolve, sep } from "node:path";
+import { readFileSync as readFileSync3, statSync } from "node:fs";
+import { extname, join as join3, resolve as resolve2, sep as sep2 } from "node:path";
 var LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 function originAllowed(origin, host, extra) {
   if (!origin) return false;
@@ -955,29 +1102,29 @@ var MIME = {
   ".woff2": "font/woff2"
 };
 function serveWeb(app2, dir) {
-  const root2 = resolve(dir);
+  const root2 = resolve2(dir);
   app2.get("/*", async (req, reply) => {
     const path = new URL(req.url, "http://x").pathname;
     if (path.startsWith("/api/")) return reply.code(404).send({ error: "not found" });
-    let file = resolve(root2, `.${path}`);
+    let file = resolve2(root2, `.${path}`);
     let isFile = false;
     try {
-      isFile = file.startsWith(root2 + sep) && statSync(file).isFile();
+      isFile = file.startsWith(root2 + sep2) && statSync(file).isFile();
     } catch {
     }
-    if (!isFile) file = join2(root2, "index.html");
-    reply.header("cache-control", file.includes(`${sep}assets${sep}`) ? "public, max-age=31536000, immutable" : "no-cache");
-    return reply.type(MIME[extname(file)] ?? "application/octet-stream").send(readFileSync2(file));
+    if (!isFile) file = join3(root2, "index.html");
+    reply.header("cache-control", file.includes(`${sep2}assets${sep2}`) ? "public, max-age=31536000, immutable" : "no-cache");
+    return reply.type(MIME[extname(file)] ?? "application/octet-stream").send(readFileSync3(file));
   });
 }
 
 // src/push.ts
 import webpush from "web-push";
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { join as join3 } from "node:path";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join4 } from "node:path";
 var read = (file) => {
   try {
-    return JSON.parse(readFileSync3(file, "utf8"));
+    return JSON.parse(readFileSync4(file, "utf8"));
   } catch {
     return null;
   }
@@ -987,12 +1134,12 @@ var Push = class {
   subs;
   subsFile;
   constructor(dataDir2) {
-    const keyFile = join3(dataDir2, "vapid.json");
+    const keyFile = join4(dataDir2, "vapid.json");
     let keys = read(keyFile);
     if (!keys) writeFileSync2(keyFile, JSON.stringify(keys = webpush.generateVAPIDKeys()), { mode: 384 });
     webpush.setVapidDetails(process.env.GCNB_VAPID_SUBJECT ?? "https://github.com/aayanA6/gcnb", keys.publicKey, keys.privateKey);
     this.publicKey = keys.publicKey;
-    this.subsFile = join3(dataDir2, "push.json");
+    this.subsFile = join4(dataDir2, "push.json");
     this.subs = read(this.subsFile) ?? [];
   }
   get count() {
@@ -1020,15 +1167,16 @@ var Push = class {
 var GROUP_CAP = Number(process.env.GCNB_GROUP_HOURLY_CAP_USD ?? 5);
 var root = fileURLToPath(new URL("../../..", import.meta.url));
 var port = Number(process.env.GCNB_PORT ?? 8787);
-var dataDir = process.env.GCNB_DATA_DIR ?? join4(root, ".gcnb");
-var avatarDir = join4(dataDir, "avatars");
+var dataDir = process.env.GCNB_DATA_DIR ?? join5(root, ".gcnb");
+var avatarDir = join5(dataDir, "avatars");
 mkdirSync(avatarDir, { recursive: true });
-var db = openDb(join4(dataDir, "gcnb.db"));
-var webDir = process.env.GCNB_WEB_DIR ?? join4(root, "apps", "web", "dist");
+var db = openDb(join5(dataDir, "gcnb.db"));
+var webDir = process.env.GCNB_WEB_DIR ?? join5(root, "apps", "web", "dist");
 var WHISPER_URL = process.env.GCNB_WHISPER_URL;
 var STOP_AFTER_MIN = Number(process.env.GCNB_STOP_AFTER_MIN ?? 0);
 var COLORS = ["#ffd23f", "#3ddc97", "#ff6b4a", "#b9a5ff", "#5ce1ff"];
-var agentFiles = loadAgents(process.env.GCNB_AGENTS_DIR ?? join4(root, ".claude", "agents"));
+var agentsDir = process.env.GCNB_AGENTS_DIR ?? join5(root, ".claude", "agents");
+var agentFiles = loadAgents(agentsDir);
 agentFiles.forEach(
   (a, i) => db.seedContact(
     {
@@ -1039,7 +1187,7 @@ agentFiles.forEach(
       color: COLORS[i % COLORS.length],
       bio: a.description,
       model: a.model ?? process.env.GCNB_MODEL ?? "sonnet",
-      cwd: resolve2(process.env.GCNB_CWD ?? root),
+      cwd: resolve3(process.env.GCNB_CWD ?? root),
       // "allow everything": tools run without asking until Phase 3 approval cards. The server stays on 127.0.0.1.
       permissionMode: [a.permissionMode, process.env.GCNB_PERMISSION_MODE].find((m) => PERMISSION_MODES.includes(m)) ?? "bypassPermissions",
       budgetUsd: Number(process.env.GCNB_BUDGET_USD ?? 2)
@@ -1080,21 +1228,30 @@ var mcpToken = randomUUID3();
 var mcpUrl = `http://127.0.0.1:${port}/mcp`;
 var runtimes = /* @__PURE__ */ new Map();
 var router = new Router(db, runtimes, broadcast);
-for (const a of agentFiles)
-  runtimes.set(
-    a.name,
-    new AgentRuntime(db, a.name, a, broadcast, {
-      handOff: (from, d, to, message) => router.handOff(from, d, to, message),
-      groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
-      isGroup: (threadId) => threadId.startsWith("g-"),
-      mcpUrl,
-      mcpToken
-    })
-  );
+function addRuntime(a) {
+  const rt = new AgentRuntime(db, a.name, a, broadcast, {
+    handOff: (from, d, to, message) => router.handOff(from, d, to, message),
+    groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
+    isGroup: (threadId) => threadId.startsWith("g-"),
+    mcpUrl,
+    mcpToken
+  });
+  runtimes.set(a.name, rt);
+  rt.importTerminal();
+  return rt;
+}
+function syncHq() {
+  if (!runtimes.has("manager")) return;
+  const hq = db.threads().find((t) => t.kind === "group" && t.title === "hq");
+  if (hq) db.addMembers(hq.id, [...runtimes.keys()]);
+  else db.createGroup({ title: "hq", contactIds: [...runtimes.keys()], leadContactId: "manager", hourlyCapUsd: GROUP_CAP });
+}
+for (const a of agentFiles) addRuntime(a);
 registerMcp(app, runtimes, mcpToken);
 var trio = ["planner", "coder", "reviewer"];
 if (trio.every((id) => runtimes.has(id)) && !db.threads().some((t) => t.kind === "group"))
   db.createGroup({ title: "launch crew", contactIds: trio, leadContactId: "planner", hourlyCapUsd: GROUP_CAP });
+syncHq();
 var visibleThreads = () => db.threads().filter((t) => t.contactIds.every((id) => runtimes.has(id)));
 var snapshot = () => {
   const threads2 = visibleThreads();
@@ -1124,6 +1281,7 @@ function handle(ev, ws) {
     return;
   }
   if (ev.type === "interrupt") return void runtimes.get(ev.contactId)?.interrupt();
+  if (ev.type === "handToTerminal") return void runtimes.get(ev.contactId)?.close();
   const rt = runtimes.get(ev.contactId);
   const c = db.contact(ev.contactId);
   if (!rt || !c) return;
@@ -1135,8 +1293,8 @@ function handle(ev, ws) {
     patch.model = ev.model;
     setAgentModel(agentFiles.find((a) => a.name === c.agentName).path, ev.model);
   }
-  if (ev.cwd && resolve2(ev.cwd) !== c.cwd) {
-    const cwd = resolve2(ev.cwd);
+  if (ev.cwd && resolve3(ev.cwd) !== c.cwd) {
+    const cwd = resolve3(ev.cwd);
     let isDir = false;
     try {
       isDir = statSync2(cwd).isDirectory();
@@ -1179,13 +1337,43 @@ wss.on("connection", (ws) => {
 });
 var IMAGE_TYPES = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
 app.addContentTypeParser(Object.keys(IMAGE_TYPES), { parseAs: "buffer" }, (_req, body, done) => done(null, body));
+app.post("/api/contacts", async (req, reply) => {
+  const parsed = CreateContact.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad contact", issues: parsed.error.issues });
+  const data = parsed.data;
+  if (runtimes.has(data.name)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
+  const path = agentFilePath(agentsDir, data.name);
+  if (!path || existsSync2(path)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
+  writeFileSync3(path, agentFileText({ name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions }));
+  const a = { name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions, path };
+  db.seedContact(
+    {
+      id: a.name,
+      agentName: a.name,
+      displayName: data.displayName,
+      avatarPath: null,
+      color: data.color ?? COLORS[agentFiles.length % COLORS.length],
+      bio: data.description,
+      model: data.model,
+      cwd: data.cwd ? resolve3(data.cwd) : resolve3(process.env.GCNB_CWD ?? root),
+      permissionMode: data.permissionMode,
+      budgetUsd: data.budgetUsd ?? Number(process.env.GCNB_BUDGET_USD ?? 2)
+    },
+    `dm-${a.name}`
+  );
+  agentFiles.push(a);
+  addRuntime(a);
+  syncHq();
+  broadcast(snapshot());
+  return db.contact(a.name);
+});
 app.post("/api/contacts/:id/avatar", async (req, reply) => {
   const c = db.contact(req.params.id);
   const ext = IMAGE_TYPES[req.headers["content-type"] ?? ""];
   if (!c || !runtimes.has(c.id)) return reply.code(404).send({ error: "no such contact" });
   if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) return reply.code(415).send({ error: "send a png, jpeg, webp or gif" });
-  for (const f of readdirSync2(avatarDir)) if (f.startsWith(`${c.id}.`)) rmSync(join4(avatarDir, f));
-  writeFileSync3(join4(avatarDir, `${c.id}.${ext}`), req.body);
+  for (const f of readdirSync2(avatarDir)) if (f.startsWith(`${c.id}.`)) rmSync(join5(avatarDir, f));
+  writeFileSync3(join5(avatarDir, `${c.id}.${ext}`), req.body);
   db.updateContact(c.id, { avatarPath: `/api/avatars/${c.id}.${ext}?v=${Date.now()}` });
   const contact = db.contact(c.id);
   broadcast({ type: "contact", contact });
@@ -1195,7 +1383,7 @@ app.get("/api/avatars/:file", async (req, reply) => {
   const m = /^([a-z0-9][a-z0-9_-]*)\.(png|jpg|webp|gif)$/i.exec(req.params.file);
   if (!m) return reply.code(404).send();
   try {
-    const body = readFileSync4(join4(avatarDir, req.params.file));
+    const body = readFileSync5(join5(avatarDir, req.params.file));
     const type = Object.entries(IMAGE_TYPES).find(([, e]) => e === m[2].toLowerCase())[0];
     return reply.type(type).header("x-content-type-options", "nosniff").send(body);
   } catch {
@@ -1228,7 +1416,7 @@ app.post("/api/transcribe", async (req, reply) => {
   }
 });
 app.get("/api/health", async () => ({ ok: true, agents: [...runtimes.values()].map((r) => ({ ...r.state(), running: r.running })) }));
-if (existsSync2(join4(webDir, "index.html"))) serveWeb(app, webDir);
+if (existsSync2(join5(webDir, "index.html"))) serveWeb(app, webDir);
 async function shutdown() {
   for (const r of runtimes.values()) r.shutdown();
   await app.close();

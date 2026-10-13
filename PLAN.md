@@ -222,6 +222,16 @@ Gaps:
   has booted needs a restart to be picked up (same granularity as the old `ANTHROPIC_API_KEY` check,
   which also only read the env once at boot).
 
+## Post-Phase-5 additions
+
+What shipped, past the original six-phase plan:
+
+- **Manager + #hq**: a `manager.md` agent, if present, leads **#hq**, a group of every contact kept in sync as contacts come and go; an un-mentioned post there goes to the manager. Verified: `pnpm test` and the server booting with the manager file present, syncing #hq membership. Not exercised live: a manager actually routing a real multi-hop task through #hq against a live subscription.
+- **Create contacts from gcnb**: `POST /api/contacts` writes an agent file, seeds the contact and broadcasts a snapshot; **+ Contact** in the web UI builds and validates one client-side with the shared `CreateContact` schema before sending it. Verified: typecheck, server test, a bounded 400/409 shape check on the endpoint. Not exercised live: creating a contact against a running server and chatting with it end to end.
+- **Terminal hand-off / import**: `handToTerminal` closes gcnb's own process for a contact so `claude --resume` is the only writer; `importTerminal()` picks up a session that already exists on disk at boot; turns run outside gcnb are tagged `source: 'terminal'` and show an **in terminal** tag on their bubbles. Verified: typecheck and the existing server test suite. **Not exercised live: the actual round trip** — handing a contact to a terminal, typing a turn there, and seeing it imported back into the DM tagged "in terminal".
+- **DM "what they're up to" status**: a DM's header (and the PiP's) derives the contact's newest activity in *other* threads client-side — an open card, a typing turn, or a recent tool/agent line — and shows it in place of "Online", clickable to jump to that thread. No new server events. Verified: typecheck only; not exercised against a live multi-thread session with real timing.
+- **Pop-out mini chat**: a Document Picture-in-Picture window sharing the main page's JS realm, hardened this round against a stuck recording on unmount and a double `requestWindow()` call. Verified: typecheck; Chrome/Edge's actual native PiP behavior (window close timing, permission prompts) not exercised live in this session.
+
 ## Decisions
 
 - Monthly API budget: not set. Per-contact cap defaults to $2 (`GCNB_BUDGET_USD`) on `sonnet`.

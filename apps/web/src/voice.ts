@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 // Voice input. Local Whisper (the server proxies to GCNB_WHISPER_URL, so audio stays on your machine) when
 // it's set up; otherwise the browser's built-in speech recognition (Chrome/Safari send audio to their cloud).
@@ -36,6 +36,10 @@ export function useVoice(engine: Engine, onText: (text: string, send: boolean) =
     setRec(null)
     if (send !== null && text.trim()) done.current(text.trim(), send)
   }
+
+  // If the component holding this hook unmounts mid-recording (e.g. the PiP window closes natively
+  // while you're talking), cancel instead of leaving the mic open with nothing to stop it.
+  useEffect(() => () => stopRef.current?.(null), [])
 
   async function start() {
     if (!engine || stopRef.current) return

@@ -55,19 +55,28 @@ function useMirrorStyles(win: Window | null) {
 export function usePip(title = 'gcnb') {
   const [win, setWin] = useState<Window | null>(null)
   const winRef = useRef<Window | null>(null)
+  const pendingRef = useRef(false) // a requestWindow() already in flight: don't fire a second one
   useMirrorStyles(win)
 
-  const open = async () => {
-    if (winRef.current) return winRef.current.focus() // already open: just bring it forward
-    if (!window.documentPictureInPicture) return
-    const pipWin = await window.documentPictureInPicture.requestWindow({ width: 380, height: 560 })
-    pipWin.document.title = title
-    pipWin.addEventListener('pagehide', () => {
-      winRef.current = null
-      setWin(null)
-    })
-    winRef.current = pipWin
-    setWin(pipWin)
+  const open = () => {
+    if (winRef.current) return void winRef.current.focus() // already open: just bring it forward
+    if (pendingRef.current || !window.documentPictureInPicture) return
+    pendingRef.current = true
+    window.documentPictureInPicture
+      .requestWindow({ width: 380, height: 560 })
+      .then((pipWin) => {
+        pipWin.document.title = title
+        pipWin.addEventListener('pagehide', () => {
+          winRef.current = null
+          setWin(null)
+        })
+        winRef.current = pipWin
+        setWin(pipWin)
+      })
+      .catch(() => {}) // the user dismissed the permission/placement prompt, or the browser refused
+      .finally(() => {
+        pendingRef.current = false
+      })
   }
   const close = () => winRef.current?.close()
 
