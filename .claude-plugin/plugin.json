@@ -1,6 +1,6 @@
 {
   "name": "gcnb",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "iMessage-style chat UI for your Claude Code agents: persistent contacts, group chats, approvals and voice, reachable from your phone over Tailscale.",
   "author": { "name": "Aayan" }
 }

@@ -8,7 +8,8 @@ const os = require('node:os')
 const { spawn } = require('node:child_process')
 
 const root = path.dirname(__dirname) // bin/.. = the plugin root ($CLAUDE_PLUGIN_ROOT)
-const dataDir = process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), '.gcnb') // never write state under root
+// Claude Code sets CLAUDE_PLUGIN_DATA for hooks but not for the Bash tool, so fall back to the same folder.
+const dataDir = process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), '.claude', 'plugins', 'data', 'gcnb-gcnb') // never write state under root
 fs.mkdirSync(dataDir, { recursive: true })
 const pidFile = path.join(dataDir, 'gcnb.pid')
 const logFile = path.join(dataDir, 'gcnb.log')
@@ -66,6 +67,8 @@ async function up() {
     return
   }
 
+  await installDeps() // no-op when current; covers a plugin installed mid-session (SessionStart hasn't run)
+
   // ESM ignores NODE_PATH, so the bundled server is copied next to the node_modules installed for it
   // (by `install-deps`, below): module resolution then finds them by walking up from app/ to data/.
   const appDir = path.join(dataDir, 'app')
@@ -86,7 +89,14 @@ async function up() {
   child.unref()
   fs.writeFileSync(pidFile, String(child.pid))
 
-  for (let i = 0; i < 20 && !(await health()); i++) await new Promise((r) => setTimeout(r, 300))
+  let ok = false
+  for (let i = 0; i < 40 && !(ok = await health()); i++) await new Promise((r) => setTimeout(r, 300))
+  if (!ok) {
+    fs.rmSync(pidFile, { force: true })
+    const log = fs.readFileSync(logFile, 'utf8').trim().split(/\r?\n/).slice(-15).join('\n')
+    throw new Error(`gcnb failed to start. Last log lines (${logFile}):
+${log}`)
+  }
   if (!noOpen) openBrowser(url)
   console.log(`gcnb started at ${url}`)
 }
@@ -118,7 +128,9 @@ async function installDeps() {
   fs.copyFileSync(manifestSrc, manifestDst)
   console.log('gcnb: installing server dependencies...')
   await new Promise((resolve, reject) => {
-    const p = spawn(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--omit=dev'], { cwd: dataDir, stdio: 'inherit' })
+    // Windows: Node refuses to spawn npm.cmd without a shell; the arguments are constants, so that's safe.
+    const p = spawn('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], { cwd: dataDir, stdio: ['ignore', 'inherit', 'inherit'], shell: process.platform === 'win32' })
+    p.on('error', reject)
     p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`npm install exited ${code}`))))
   })
 }
