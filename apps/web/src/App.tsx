@@ -83,7 +83,7 @@ function useGcnb(onEvent: (e: ServerEvent) => void, pipOpenRef: RefObject<boolea
       ws.current?.close()
     }
   }, [])
-  const emit = (ev: ClientEvent) => ws.current?.send(JSON.stringify(ev))
+  const emit = (ev: ClientEvent) => ws.current?.readyState === WebSocket.OPEN && ws.current.send(JSON.stringify(ev))
   return { state, emit }
 }
 
@@ -343,7 +343,13 @@ function Composer({ name, mentions, disabled, engine, onSend, targetWindow = win
   // Hold Space to talk (in an empty box, or with nothing focused); let go to drop the transcript in the box.
   useEffect(() => {
     if (!engine) return
-    const idle = (t: EventTarget | null) => t === targetWindow.document.body || (t instanceof HTMLTextAreaElement && t.dataset.composer !== undefined && !t.value)
+    // `instanceof HTMLTextAreaElement` would fail here when `t` was created in the PiP window's own
+    // document — a different realm with its own HTMLTextAreaElement constructor — so duck-type instead.
+    const idle = (t: EventTarget | null) => {
+      if (t === targetWindow.document.body) return true
+      const el = t as HTMLTextAreaElement | null
+      return !!el && el.tagName === 'TEXTAREA' && el.dataset?.composer !== undefined && !el.value
+    }
     const down = (e: KeyboardEvent) => {
       if (e.key !== ' ' || !idle(e.target)) return
       e.preventDefault() // a leading space is useless anyway
@@ -862,19 +868,24 @@ export default function App() {
   }, [state.messages.length, pip.win, pipView])
 
   // Fitts's law: Y allows once, N denies the newest open approval card (not while typing in a field).
-  // Listens on the PiP window too, since its keystrokes never reach the opener's `window`.
+  // Listens on the PiP window too, since its keystrokes never reach the opener's `window` — and answers
+  // *its own* thread's card there, since the PiP is very often showing a different thread than this one.
   const openApproval = messages.findLast((m) => m.kind === 'approval' && m.body.status === 'pending')
+  const pipOpenApproval = pipMessages.findLast((m) => m.kind === 'approval' && m.body.status === 'pending')
   useEffect(() => {
-    if (!openApproval) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey || e.altKey || (e.target as HTMLElement).closest('input, textarea, select, [contenteditable]')) return
-      const decision = e.key.toLowerCase() === 'y' ? 'allow' : e.key.toLowerCase() === 'n' ? 'deny' : null
-      if (decision) answer(openApproval)({ decision })
-    }
-    const targets = pip.win ? [window, pip.win] : [window]
-    targets.forEach((w) => w.addEventListener('keydown', onKey))
-    return () => targets.forEach((w) => w.removeEventListener('keydown', onKey))
-  })
+    if (!openApproval && !pipOpenApproval) return
+    const targets: [Window, Message | undefined][] = pip.win ? [[window, openApproval], [pip.win, pipOpenApproval]] : [[window, openApproval]]
+    const listeners = targets.map(([w, card]) => {
+      const onKey = (e: KeyboardEvent) => {
+        if (!card || e.ctrlKey || e.metaKey || e.altKey || (e.target as HTMLElement).closest('input, textarea, select, [contenteditable]')) return
+        const decision = e.key.toLowerCase() === 'y' ? 'allow' : e.key.toLowerCase() === 'n' ? 'deny' : null
+        if (decision) answer(card)({ decision })
+      }
+      w.addEventListener('keydown', onKey)
+      return [w, onKey] as const
+    })
+    return () => listeners.forEach(([w, onKey]) => w.removeEventListener('keydown', onKey))
+  }, [openApproval, pipOpenApproval, pip.win])
 
   const openPip = (toCurrentChat: boolean) => {
     if (toCurrentChat && thread) {
