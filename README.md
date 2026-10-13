@@ -63,6 +63,10 @@ tailscale serve --bg 8787
 
 Open `https://<machine>.<tailnet>.ts.net` on your phone, **Add to Home Screen**, then tap **Turn on pings** in the sidebar. iOS only delivers push notifications to a Home-Screen-installed PWA, not to Safari itself.
 
+### Pop-out mini chat
+
+Chrome/Edge 116+ only. Click **Pop out** (sidebar or chat header) to float a small always-on-top chat window over every app and tab, backed by the same connection as the main window. **Expand** brings you back to the full window and closes it.
+
 ### Voice
 
 Set `GCNB_WHISPER_URL` to a local Whisper server's inference endpoint, e.g. whisper.cpp's `whisper-server --convert` at `http://127.0.0.1:8080/inference`, and recordings are transcribed on your machine. `GCNB_WHISPER_MODEL` additionally names a model for OpenAI-style servers that require one. With no `GCNB_WHISPER_URL` set, the composer's mic button falls back to the browser's own speech recognition (Chrome, Edge, Safari), which sends the audio to the browser vendor's cloud rather than keeping it on your machine.

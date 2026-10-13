@@ -155,6 +155,10 @@ Not done yet:
 
 Deliberately deferred, per the plan: pick based on what you actually miss after using Phase 5.
 
+### Pop-out mini chat (early pick)
+
+A **Pop out** button (sidebar header, chat header; shown only when `'documentPictureInPicture' in window`) opens an always-on-top mini window via the Document Picture-in-Picture API — same socket, same React state, portaled in with `createPortal`. Styles and theme CSS variables are mirrored into the PiP document and kept in sync; the mini window remembers its own list/chat view and jumps to a thread when it starts needing you while sitting on the list. Counts as "on screen" for push/unread while open. Chrome/Edge 116+ only.
+
 ## Subscription runtime
 
 Replaced `@anthropic-ai/claude-agent-sdk` with driving the user's own `claude` CLI (v2.1.296+) as one

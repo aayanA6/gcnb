@@ -1,8 +1,10 @@
-import { Fragment, useEffect, useReducer, useRef, useState } from 'react'
+import { Fragment, useEffect, useReducer, useRef, useState, type RefObject } from 'react'
+import { createPortal } from 'react-dom'
 import { HOP_LIMIT, PERMISSION_MODES, ServerEvent, noteFor, type AgentState, type ClientEvent, type Contact, type Decision, type Message, type Question, type Thread, type Typing } from '@gcnb/shared'
 import { applyTheme, themes } from './theme.ts'
 import { currentPings, enablePings, localNotify, onOpenThread, type Config, type Pings } from './pwa.ts'
 import { useVoice, voiceEngine, type Engine } from './voice.ts'
+import { usePip } from './pip.tsx'
 
 type State = {
   connected: boolean
@@ -42,8 +44,9 @@ function reduce(s: State, e: Action): State {
 }
 
 // One socket to the server; reconnects every second and gets a fresh snapshot on open.
-// It also tells the server whether this tab is on screen, so phone pings only fire when nobody's looking.
-function useGcnb(onEvent: (e: ServerEvent) => void) {
+// It also tells the server whether this tab is on screen, so phone pings only fire when nobody's looking —
+// `pipOpenRef` counts the PiP mini window as "looking" too, since it floats on top of everything else.
+function useGcnb(onEvent: (e: ServerEvent) => void, pipOpenRef: RefObject<boolean>) {
   const [state, dispatch] = useReducer(reduce, initial)
   const ws = useRef<WebSocket | null>(null)
   const handler = useRef(onEvent)
@@ -52,7 +55,7 @@ function useGcnb(onEvent: (e: ServerEvent) => void) {
     let stopped = false
     let timer = 0
     const send = (ev: ClientEvent) => ws.current?.readyState === WebSocket.OPEN && ws.current.send(JSON.stringify(ev))
-    const visibility = () => send({ type: 'visible', on: !document.hidden })
+    const visibility = () => send({ type: 'visible', on: pipOpenRef.current || !document.hidden })
     const connect = () => {
       const sock = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`)
       ws.current = sock
@@ -310,6 +313,7 @@ const ICONS = {
   info: 'M12 16v-4M12 8h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18',
   mic: 'M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3M5 11a7 7 0 0 0 14 0M12 18v3',
   bell: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0',
+  popout: 'M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h6',
 }
 const Icon = ({ d }: { d: keyof typeof ICONS }) => (
   <svg aria-hidden viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
@@ -319,7 +323,10 @@ const Icon = ({ d }: { d: keyof typeof ICONS }) => (
 
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`
 
-function Composer({ name, mentions, disabled, engine, onSend }: { name: string; mentions?: string[]; disabled: boolean; engine: Engine; onSend: (text: string) => void }) {
+// `targetWindow` is the browsing context that actually gets the keydown/keyup events: the main
+// window normally, or the PiP window when this Composer is portaled into it (its own top-level
+// context, so listeners on the opener's `window` never see its keystrokes).
+function Composer({ name, mentions, disabled, engine, onSend, targetWindow = window }: { name: string; mentions?: string[]; disabled: boolean; engine: Engine; onSend: (text: string) => void; targetWindow?: Window }) {
   const [text, setText] = useState('')
   const [, tick] = useState(0)
   const held = useRef(false) // recording started by holding Space
@@ -336,7 +343,7 @@ function Composer({ name, mentions, disabled, engine, onSend }: { name: string; 
   // Hold Space to talk (in an empty box, or with nothing focused); let go to drop the transcript in the box.
   useEffect(() => {
     if (!engine) return
-    const idle = (t: EventTarget | null) => t === document.body || (t instanceof HTMLTextAreaElement && t.dataset.composer !== undefined && !t.value)
+    const idle = (t: EventTarget | null) => t === targetWindow.document.body || (t instanceof HTMLTextAreaElement && t.dataset.composer !== undefined && !t.value)
     const down = (e: KeyboardEvent) => {
       if (e.key !== ' ' || !idle(e.target)) return
       e.preventDefault() // a leading space is useless anyway
@@ -351,11 +358,11 @@ function Composer({ name, mentions, disabled, engine, onSend }: { name: string; 
         voice.stop(false)
       }
     }
-    window.addEventListener('keydown', down)
-    window.addEventListener('keyup', up)
+    targetWindow.addEventListener('keydown', down)
+    targetWindow.addEventListener('keyup', up)
     return () => {
-      window.removeEventListener('keydown', down)
-      window.removeEventListener('keyup', up)
+      targetWindow.removeEventListener('keydown', down)
+      targetWindow.removeEventListener('keyup', up)
     }
   })
   useEffect(() => {
@@ -739,6 +746,12 @@ export default function App() {
   const pageVisible = usePageVisible()
   const scroller = useRef<HTMLDivElement>(null)
 
+  // Pop-out mini chat (Document Picture-in-Picture): its own view/thread, remembered only in state.
+  const pip = usePip()
+  const [pipView, setPipView] = useState<'list' | 'chat'>('list')
+  const [pipThreadId, setPipThreadId] = useState<string | null>(null)
+  const pipScroller = useRef<HTMLDivElement>(null)
+
   const selectThread = (id: string) => {
     setThreadId(id)
     setView('chat')
@@ -757,8 +770,14 @@ export default function App() {
     const note = noteFor(e.message, nameOf, th?.kind === 'group' ? th.title : undefined)
     if (note) localNotify(note, selectThread)
   }
-  const { state, emit } = useGcnb(onEvent)
+  // While the PiP is open it counts as "on screen" even if this tab is hidden, so phone push stays quiet.
+  const pipOpenRef = useRef(false)
+  const { state, emit } = useGcnb(onEvent, pipOpenRef)
   stateRef.current = state
+  useEffect(() => {
+    pipOpenRef.current = !!pip.win
+    emit({ type: 'visible', on: pipOpenRef.current || !document.hidden })
+  }, [pip.win])
 
   useEffect(() => onOpenThread(selectThread), [])
 
@@ -802,7 +821,48 @@ export default function App() {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight })
   }, [messages.length, typers.length, waiting])
 
+  // The PiP's own thread (independent of the main window's) — falls back to the main thread once, so
+  // Pop out from the chat header opens straight into what you were already looking at.
+  const pipThread = state.threads.find((t) => t.id === pipThreadId) ?? (pipThreadId === null ? thread : undefined)
+  const pipIsGroup = pipThread?.kind === 'group'
+  const pipMembers = pipThread ? membersOf(pipThread) : []
+  const pipContact = pipIsGroup ? undefined : pipMembers[0]
+  const pipMessages = state.messages.filter((m) => m.threadId === pipThread?.id)
+  const pipLastUserId = pipMessages.findLast((m) => m.sender === 'user')?.id
+  const pipTypers = pipThread ? membersOf(pipThread).filter((c) => typingIn(pipThread.id).includes(c.id)) : []
+
+  // The PiP's open thread counts as "on screen" for unread purposes whenever the PiP is open and
+  // showing it, same idea as `chatOnScreen` above but independent of this tab's own visibility.
+  useEffect(() => {
+    if (!pip.win || pipView !== 'chat' || !pipThread) return
+    setSeen((s) => {
+      const next = { ...s, [pipThread.id]: Date.now() }
+      save('gcnb.seen', next)
+      return next
+    })
+  }, [pip.win, pipView, pipThread?.id, pipMessages.length])
+
+  useEffect(() => {
+    pipScroller.current?.scrollTo({ top: pipScroller.current.scrollHeight })
+  }, [pipMessages.length, pipTypers.length])
+
+  // A card newly needing you jumps the PiP to that thread, but only while it was sitting on the list
+  // (don't yank someone off a chat they're mid-read of for a *different* thread's card).
+  const prevNeedsRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const now = new Set(state.threads.filter((t) => threadNeedsYou(t.id)).map((t) => t.id))
+    if (pip.win && pipView === 'list') {
+      const fresh = [...now].find((id) => !prevNeedsRef.current.has(id))
+      if (fresh) {
+        setPipThreadId(fresh)
+        setPipView('chat')
+      }
+    }
+    prevNeedsRef.current = now
+  }, [state.messages.length, pip.win, pipView])
+
   // Fitts's law: Y allows once, N denies the newest open approval card (not while typing in a field).
+  // Listens on the PiP window too, since its keystrokes never reach the opener's `window`.
   const openApproval = messages.findLast((m) => m.kind === 'approval' && m.body.status === 'pending')
   useEffect(() => {
     if (!openApproval) return
@@ -811,9 +871,18 @@ export default function App() {
       const decision = e.key.toLowerCase() === 'y' ? 'allow' : e.key.toLowerCase() === 'n' ? 'deny' : null
       if (decision) answer(openApproval)({ decision })
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    const targets = pip.win ? [window, pip.win] : [window]
+    targets.forEach((w) => w.addEventListener('keydown', onKey))
+    return () => targets.forEach((w) => w.removeEventListener('keydown', onKey))
   })
+
+  const openPip = (toCurrentChat: boolean) => {
+    if (toCurrentChat && thread) {
+      setPipThreadId(thread.id)
+      setPipView('chat')
+    }
+    pip.open()
+  }
 
   const status = !state.connected
     ? 'Reconnecting…'
@@ -861,14 +930,16 @@ export default function App() {
   const totalBudget = state.contacts.reduce((s, c) => s + c.budgetUsd, 0)
 
   // A message row, with the date pill and date-aware grouping stripped out of the big ol' kind switch.
-  const renderMessage = (m: Message) => {
+  // Factored so the PiP mini window can render the same rows for whatever thread it's showing,
+  // which isn't necessarily this one (hence isGroup/lastUserId as params, not closed-over).
+  const renderMessageFor = (grp: boolean, lastUserIdVal: string | undefined) => (m: Message) => {
     const who = byId(m.contactId)
     if (m.body.handoff) return <HandoffPill m={m} from={byId(m.body.handoff.from)} to={byId(m.body.handoff.to)} />
-    if (m.kind === 'tool') return <ToolLine m={m} c={isGroup ? who : undefined} />
+    if (m.kind === 'tool') return <ToolLine m={m} c={grp ? who : undefined} />
     if (m.kind === 'approval') return <ApprovalCard m={m} onAnswer={answer(m)} />
     if (m.kind === 'question') return <QuestionCard m={m} onAnswer={answer(m)} />
     // In a group, agent bubbles carry their pfp and name.
-    if (isGroup && m.sender === 'agent' && who)
+    if (grp && m.sender === 'agent' && who)
       return (
         <div className="flex max-w-[85%] items-end gap-2 self-start">
           <Avatar c={who} size="size-7 text-[10px]" />
@@ -880,8 +951,9 @@ export default function App() {
           </div>
         </div>
       )
-    return <Bubble m={m} showReceipt={m.id === lastUserId} />
+    return <Bubble m={m} showReceipt={m.id === lastUserIdVal} />
   }
+  const renderMessage = renderMessageFor(isGroup, lastUserId)
 
   return (
     <div className="grid h-dvh grid-cols-1 gap-2 p-2 md:grid-cols-[260px_1fr] md:gap-3 md:p-3 lg:grid-cols-[260px_1fr_280px]">
@@ -891,9 +963,21 @@ export default function App() {
             <div className="title-type text-3xl font-bold">gcnb</div>
             <div className="text-xs text-muted">gc, no burger</div>
           </div>
-          <button className="btn bg-accent px-2.5 py-1 text-sm text-on-accent" onClick={() => setCreating(!creating)} aria-expanded={creating}>
-            + Group
-          </button>
+          <div className="flex items-center gap-1.5">
+            {pip.supported && (
+              <button
+                aria-label="Pop out mini chat"
+                title="Pop out: an always-on-top mini window"
+                onClick={() => openPip(false)}
+                className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink"
+              >
+                <Icon d="popout" />
+              </button>
+            )}
+            <button className="btn bg-accent px-2.5 py-1 text-sm text-on-accent" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+              + Group
+            </button>
+          </div>
         </div>
         {creating && (
           <NewGroup
@@ -1006,6 +1090,16 @@ export default function App() {
                   {isGroup ? '❚❚ Pause all' : '■ Stop'}
                 </button>
               )}
+              {pip.supported && (
+                <button
+                  aria-label="Pop out mini chat"
+                  title="Pop out: an always-on-top mini window"
+                  onClick={() => openPip(true)}
+                  className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink"
+                >
+                  <Icon d="popout" />
+                </button>
+              )}
               <button aria-label="Chat info" onClick={() => setInfoOpen(true)} className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink lg:hidden">
                 <Icon d="info" />
               </button>
@@ -1045,6 +1139,90 @@ export default function App() {
           onSave={(patch) => emit({ type: 'updateContact', contactId: contact.id, ...patch })}
         />
       )}
+
+      {pip.win &&
+        createPortal(
+          <div className="flex h-dvh min-h-0 flex-col bg-app text-ink">
+            {pipView === 'chat' && pipThread && pipMembers.length ? (
+              <>
+                <header className="rule-b flex items-center gap-2 p-2">
+                  <button aria-label="Back to chats" onClick={() => setPipView('list')} className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink">
+                    <Icon d="back" />
+                  </button>
+                  {pipContact ? <Avatar c={pipContact} size="size-8" /> : <Stack cs={pipMembers} size="size-6 text-[9px]" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="title-type truncate text-sm font-bold">{pipContact ? pipContact.displayName : `#${pipThread.title}`}</div>
+                    <div className="truncate text-xs text-muted">{threadNeedsYou(pipThread.id) ? 'Waiting on you' : pipTypers.length ? 'Typing…' : (pipContact?.agentName ?? 'group')}</div>
+                  </div>
+                  <button aria-label="Expand to full window" title="Expand" onClick={() => (window.focus(), pip.close())} className="btn shrink-0 bg-panel px-3 py-1.5 text-sm text-ink">
+                    Expand
+                  </button>
+                </header>
+                <div ref={pipScroller} className="wallpaper flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3" aria-live="polite">
+                  {pipMessages.map((m, i) => (
+                    <Fragment key={m.id}>
+                      {(i === 0 || m.createdAt - pipMessages[i - 1].createdAt > 1_800_000) && <DatePill ms={m.createdAt} />}
+                      {renderMessageFor(pipIsGroup, pipLastUserId)(m)}
+                    </Fragment>
+                  ))}
+                  {pipTypers.map((c) => (
+                    <TypingBubble key={c.id} c={c} showPfp={pipIsGroup} />
+                  ))}
+                </div>
+                <Composer
+                  name={pipContact ? pipContact.displayName : `#${pipThread.title}`}
+                  mentions={pipIsGroup ? pipMembers.map((c) => c.displayName) : undefined}
+                  disabled={!state.connected}
+                  engine={voiceEngine(cfg?.whisper ?? false)}
+                  targetWindow={pip.win}
+                  onSend={(text) => emit({ type: 'send', threadId: pipThread.id, text })}
+                />
+              </>
+            ) : (
+              <>
+                <header className="rule-b flex items-center justify-between gap-2 p-2">
+                  <div className="title-type text-lg font-bold">gcnb</div>
+                  <button aria-label="Expand to full window" title="Expand" onClick={() => (window.focus(), pip.close())} className="btn shrink-0 bg-panel px-3 py-1.5 text-sm text-ink">
+                    Expand
+                  </button>
+                </header>
+                <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2" aria-label="Chats">
+                  {visibleThreads.map((t) => {
+                    const ms = membersOf(t)
+                    const c = t.kind === 'dm' ? ms[0] : undefined
+                    const unread = unreadCount(t.id)
+                    return (
+                      <button
+                        key={t.id}
+                        onClick={() => {
+                          setPipThreadId(t.id)
+                          setPipView('chat')
+                        }}
+                        className="flex min-h-10 items-center gap-2 rounded-bubble p-2 text-left"
+                      >
+                        <div className="relative">
+                          {c ? <Avatar c={c} size="size-8" /> : <Stack cs={ms} size="size-6 text-[9px]" />}
+                          {threadNeedsYou(t.id) && <span className="absolute -right-0.5 -bottom-0.5 size-3 rounded-full bg-alert b-tag" aria-label="needs you" />}
+                          {unread > 0 && (
+                            <span className="btn absolute -top-1 -right-1 grid size-4 place-items-center rounded-full bg-alert px-1 text-[9px] text-on-alert" aria-label={`${unread} unread`}>
+                              {unread > 9 ? '9+' : unread}
+                            </span>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-bold">{c ? c.displayName : `#${t.title}`}</div>
+                          <div className="truncate text-xs opacity-80">{preview(t)}</div>
+                        </div>
+                      </button>
+                    )
+                  })}
+                  {visibleThreads.length === 0 && <div className="p-2 text-sm text-muted">No chats match</div>}
+                </nav>
+              </>
+            )}
+          </div>,
+          pip.win.document.body,
+        )}
     </div>
   )
 }
