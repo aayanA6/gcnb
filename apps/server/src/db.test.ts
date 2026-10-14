@@ -188,13 +188,12 @@ assert.deepEqual(spendAfterResult(0.5, 0.9, false), { spent: 1.4, lifetime: fals
   assert.match(router.handOff('coder', last('coder'), 'ghost', 'x'), /No other member called "ghost"/)
   assert.match(router.handOff('coder', { threadId: 'dm-coder', text: '', hops: 0 }, 'reviewer', 'x'), /only works inside a group/)
 
-  // Group hourly spend cap on top of each contact's cap.
+  // Group spend is tracked for display only: going past the old hourly cap no longer pauses the group.
   router.recordSpend(g.id, 1.25)
   assert.equal(router.withSpend(db3.thread(g.id)!).spentHourUsd, 1.25)
   const n = got.planner.length
   router.post(g.id, 'one more thing')
-  assert.equal(got.planner.length, n)
-  assert.equal(lines().at(-1), 'Paused: #launch crew hit its $1.00/hour spend cap')
+  assert.equal(got.planner.length, n + 1)
   db3.close()
   rmSync(dir3, { recursive: true, force: true })
 }

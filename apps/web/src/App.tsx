@@ -459,30 +459,24 @@ function CopyButton({ text, label, className = '', onHandOff }: { text: string; 
   )
 }
 type PermissionMode = (typeof PERMISSION_MODES)[number]
-type ContactPatch = { displayName?: string; model?: string; cwd?: string; budgetUsd?: number; permissionMode?: PermissionMode }
+type ContactPatch = { displayName?: string; model?: string; cwd?: string; permissionMode?: PermissionMode }
 const PERMISSION_LABELS: Record<PermissionMode, string> = {
   default: 'Ask me first',
   acceptEdits: 'Accept edits',
   plan: 'Plan only',
   bypassPermissions: 'Allow everything',
 }
+// Terminal sessions picked up from Claude Code (server: terminals.ts) have `t-` ids and no agent file.
+const isTerminal = (c: Contact) => c.id.startsWith('t-')
+const roleOf = (c: Contact) => (isTerminal(c) ? 'terminal' : c.agentName)
 const resumeCommand = (c: Contact) => `cd "${c.cwd}" && claude --resume ${c.sessionId}`
 
-// A spend bar: label, "$used / $cap", turns alert-colored at or over cap.
-function Meter({ label, used, cap }: { label: string; used: number; cap: number }) {
-  const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0
-  const over = cap > 0 && used >= cap
+// Spend so far, for information only: there's no cap (agents run on your Claude plan).
+function Meter({ label, used }: { label: string; used: number }) {
   return (
-    <div className="w-full text-sm">
-      <div className="mb-1 flex justify-between font-bold">
-        <span>{label}</span>
-        <span>
-          ${used.toFixed(2)} / ${cap.toFixed(2)}
-        </span>
-      </div>
-      <div className="field h-3 overflow-hidden">
-        <div className={`h-full ${over ? 'bg-alert' : 'bg-ok'}`} style={{ width: `${pct}%` }} />
-      </div>
+    <div className="flex w-full justify-between text-sm font-bold">
+      <span>{label}</span>
+      <span>${used.toFixed(2)}</span>
     </div>
   )
 }
@@ -510,16 +504,14 @@ const CloseDrawer = ({ onClose }: { onClose: () => void }) => (
 
 // Plan's contact card: pfp, bio, the three common edits on top, engine settings below.
 function ContactCard({ c, open, onClose, onSave, onHandOff }: { c: Contact; open: boolean; onClose: () => void; onSave: (patch: ContactPatch) => void; onHandOff: () => void }) {
-  const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, budget: String(c.budgetUsd), permissionMode: c.permissionMode })
+  const [form, setForm] = useState({ displayName: c.displayName, model: c.model, cwd: c.cwd, permissionMode: c.permissionMode })
   const [error, setError] = useState('')
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm({ ...form, [k]: e.target.value })
 
-  const budget = Number(form.budget)
   const patch: ContactPatch = {}
   if (form.displayName.trim() && form.displayName.trim() !== c.displayName) patch.displayName = form.displayName.trim()
   if (form.model !== c.model) patch.model = form.model
   if (form.cwd.trim() && form.cwd.trim() !== c.cwd) patch.cwd = form.cwd.trim()
-  if (budget > 0 && budget !== c.budgetUsd) patch.budgetUsd = budget
   if (form.permissionMode !== c.permissionMode) patch.permissionMode = form.permissionMode as PermissionMode
   const dirty = Object.keys(patch).length > 0
 
@@ -564,7 +556,7 @@ function ContactCard({ c, open, onClose, onSave, onHandOff }: { c: Contact; open
         </label>
         <label className="flex flex-col gap-1 font-bold">
           Folder
-          <input value={form.cwd} onChange={set('cwd')} className="field px-3 py-1.5 font-mono font-normal" />
+          <input value={form.cwd} onChange={set('cwd')} readOnly={isTerminal(c)} className="field px-3 py-1.5 font-mono font-normal" />
         </label>
         <label className="flex flex-col gap-1 font-bold">
           Before risky tools
@@ -576,17 +568,13 @@ function ContactCard({ c, open, onClose, onSave, onHandOff }: { c: Contact; open
             ))}
           </select>
         </label>
-        <label className="flex flex-col gap-1 font-bold">
-          Budget (USD)
-          <input type="number" min="0.01" step="0.5" value={form.budget} onChange={set('budget')} className="field px-3 py-1.5 font-normal" />
-        </label>
         <button type="submit" disabled={!dirty} className="btn bg-me py-1.5 text-on-me">
           Save
         </button>
-        <p className="text-xs text-muted">Name and pfp change now. Model, folder, permissions and budget apply from the next message.</p>
+        <p className="text-xs text-muted">Name and pfp change now. Model, folder and permissions apply from the next message.</p>
       </form>
 
-      <Meter label="Spent" used={c.spentUsd} cap={c.budgetUsd} />
+      <Meter label="Spent" used={c.spentUsd} />
       {c.sessionId && <CopyButton text={resumeCommand(c)} label="Open in terminal" className="mt-auto w-full" onHandOff={onHandOff} />}
     </aside>
   )
@@ -619,14 +607,13 @@ function NewGroup({ contacts, onCreate, onCancel }: { contacts: Contact[]; onCre
   const [title, setTitle] = useState('')
   const [ids, setIds] = useState(contacts.map((c) => c.id))
   const [lead, setLead] = useState(contacts[0]?.id ?? '')
-  const [cap, setCap] = useState('5')
-  const ok = title.trim() && ids.length >= 2 && ids.includes(lead) && Number(cap) > 0
+  const ok = title.trim() && ids.length >= 2 && ids.includes(lead)
   return (
     <form
       className="field flex flex-col gap-2 p-3 text-sm"
       onSubmit={(e) => {
         e.preventDefault()
-        if (ok) onCreate({ type: 'createGroup', title: title.trim(), contactIds: ids, leadContactId: lead, hourlyCapUsd: Number(cap) })
+        if (ok) onCreate({ type: 'createGroup', title: title.trim(), contactIds: ids, leadContactId: lead })
       }}
     >
       <input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="#group name" aria-label="Group name" maxLength={40} className="field px-2 py-1" />
@@ -648,10 +635,6 @@ function NewGroup({ contacts, onCreate, onCancel }: { contacts: Contact[]; onCre
             </option>
           ))}
         </select>
-      </label>
-      <label className="flex flex-col gap-1 font-bold">
-        Spend cap per hour (USD)
-        <input type="number" min="0.01" step="0.5" value={cap} onChange={(e) => setCap(e.target.value)} className="field px-2 py-1 font-normal" />
       </label>
       <div className="flex gap-2">
         <button type="button" onClick={onCancel} className="btn flex-1 bg-panel py-1 text-ink">
@@ -678,7 +661,6 @@ function NewContact({ defaultCwd, onCreate, onCancel }: { defaultCwd: string; on
   const [model, setModel] = useState('sonnet')
   const [cwd, setCwd] = useState('')
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default')
-  const [budget, setBudget] = useState('2')
   const [color, setColor] = useState(CONTACT_COLORS[0])
   const [avatar, setAvatar] = useState<File>()
   const [serverError, setServerError] = useState('')
@@ -693,7 +675,6 @@ function NewContact({ defaultCwd, onCreate, onCancel }: { defaultCwd: string; on
     instructions: instructions.trim(),
     model,
     permissionMode,
-    ...(Number(budget) > 0 ? { budgetUsd: Number(budget) } : {}),
     color,
     ...(cwd.trim() ? { cwd: cwd.trim() } : {}),
   })
@@ -781,10 +762,6 @@ function NewContact({ defaultCwd, onCreate, onCancel }: { defaultCwd: string; on
           ))}
         </div>
       </fieldset>
-      <label className="flex flex-col gap-1 font-bold">
-        Budget (USD)
-        <input type="number" min="0.01" step="0.5" value={budget} onChange={(e) => setBudget(e.target.value)} className="field px-2 py-1 font-normal" />
-      </label>
       <fieldset className="flex flex-col gap-1">
         <legend className="font-bold">Color</legend>
         <div className="flex gap-1.5" role="radiogroup" aria-label="Name color">
@@ -841,7 +818,7 @@ function GroupInfo({ t, members, open, onClose, statusOf }: { t: Thread; members
                   {c.displayName}
                   {c.id === t.leadContactId && <span className="ml-1 text-xs font-normal text-muted">· lead</span>}
                 </div>
-                <div className="text-xs text-muted">{c.agentName}</div>
+                <div className="text-xs text-muted">{roleOf(c)}</div>
               </div>
               <span className={`b-tag rounded-full px-2 text-xs ${s === 'Needs you' ? 'bg-alert text-on-alert' : s === 'Typing' ? 'bg-ok text-on-accent' : ''}`}>{s}</span>
             </li>
@@ -851,7 +828,7 @@ function GroupInfo({ t, members, open, onClose, statusOf }: { t: Thread; members
       <div className="text-sm">
         Pauses after <b>{HOP_LIMIT}</b> agent-to-agent hand-offs without you.
       </div>
-      {t.hourlyCapUsd !== null && <Meter label="Group spend this hour" used={spent} cap={t.hourlyCapUsd} />}
+      <Meter label="Group spend this hour" used={spent} />
     </aside>
   )
 }
@@ -923,7 +900,7 @@ export default function App() {
   const [creatingContact, setCreatingContact] = useState(false)
   const [infoOpen, setInfoOpen] = useState(false)
   const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState<'all' | 'groups' | 'needs'>('all')
+  const [filter, setFilter] = useState<'all' | 'groups' | 'terminal' | 'needs'>('all')
   const [seen, setSeen] = useState<Record<string, number>>(() => load('gcnb.seen', {}))
   const md = useMedia('(min-width: 768px)')
   const pageVisible = usePageVisible()
@@ -1131,17 +1108,17 @@ export default function App() {
   }
   const needsCount = state.threads.filter((t) => threadNeedsYou(t.id)).length
   const visibleThreads = state.threads
-    .filter((t) => (filter === 'groups' ? t.kind === 'group' : filter === 'needs' ? threadNeedsYou(t.id) : true))
+    .filter((t) => (filter === 'groups' ? t.kind === 'group' : filter === 'terminal' ? t.contactIds.some((id) => id.startsWith('t-')) : filter === 'needs' ? threadNeedsYou(t.id) : true))
     .filter(matchesQuery)
     .sort((a, b) => lastTime(b) - lastTime(a))
   const FILTERS = [
     ['all', 'All'],
     ['groups', 'Groups'],
+    ['terminal', 'Terminal'],
     ['needs', `Needs you · ${needsCount}`],
   ] as const
 
   const totalSpent = state.contacts.reduce((s, c) => s + c.spentUsd, 0)
-  const totalBudget = state.contacts.reduce((s, c) => s + c.budgetUsd, 0)
 
   // A message row, with the date pill and date-aware grouping stripped out of the big ol' kind switch.
   // Factored so the PiP mini window can render the same rows for whatever thread it's showing,
@@ -1159,7 +1136,7 @@ export default function App() {
           <Avatar c={who} size="size-7 text-[10px]" />
           <div className="flex min-w-0 flex-col">
             <div className="mb-1 text-xs font-bold">
-              {who.displayName} <span className="font-normal text-muted">· {who.agentName}</span>
+              {who.displayName} <span className="font-normal text-muted">· {roleOf(who)}</span>
             </div>
             <Bubble m={m} showReceipt={false} />
           </div>
@@ -1170,45 +1147,45 @@ export default function App() {
   const renderMessage = renderMessageFor(isGroup, lastUserId)
 
   return (
-    <div className="grid h-dvh grid-cols-1 gap-2 p-2 md:grid-cols-[260px_1fr] md:gap-3 md:p-3 lg:grid-cols-[260px_1fr_280px]">
+    <div className={`grid h-dvh grid-cols-1 gap-2 p-2 md:grid-cols-[260px_1fr] md:gap-3 md:p-3 ${thread && members.length ? 'lg:grid-cols-[260px_1fr_280px]' : ''}`}>
       <aside className={`panel min-h-0 flex-col gap-3 p-3 md:flex md:gap-4 md:p-4 ${view === 'list' ? 'flex' : 'hidden'}`}>
         <div className="flex items-start justify-between gap-2">
-          <div>
+          <div className="min-w-0">
             <div className="title-type text-3xl font-bold">gcnb</div>
             <div className="text-xs text-muted">gc, no burger</div>
           </div>
-          <div className="flex items-center gap-1.5">
-            {pip.supported && (
-              <button
-                aria-label="Pop out mini chat"
-                title="Pop out: an always-on-top mini window"
-                onClick={() => openPip(false)}
-                className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink"
-              >
-                <Icon d="popout" />
-              </button>
-            )}
+          {pip.supported && (
             <button
-              className="btn bg-panel px-2.5 py-1 text-sm text-ink"
-              onClick={() => {
-                setCreatingContact(!creatingContact)
-                setCreating(false)
-              }}
-              aria-expanded={creatingContact}
+              aria-label="Pop out mini chat"
+              title="Pop out: an always-on-top mini window"
+              onClick={() => openPip(false)}
+              className="btn grid size-10 shrink-0 place-items-center bg-panel text-ink"
             >
-              + Contact
+              <Icon d="popout" />
             </button>
-            <button
-              className="btn bg-accent px-2.5 py-1 text-sm text-on-accent"
-              onClick={() => {
-                setCreating(!creating)
-                setCreatingContact(false)
-              }}
-              aria-expanded={creating}
-            >
-              + Group
-            </button>
-          </div>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <button
+            className="btn flex-1 whitespace-nowrap bg-panel px-2.5 py-1.5 text-sm text-ink"
+            onClick={() => {
+              setCreatingContact(!creatingContact)
+              setCreating(false)
+            }}
+            aria-expanded={creatingContact}
+          >
+            + Contact
+          </button>
+          <button
+            className="btn flex-1 whitespace-nowrap bg-accent px-2.5 py-1.5 text-sm text-on-accent"
+            onClick={() => {
+              setCreating(!creating)
+              setCreatingContact(false)
+            }}
+            aria-expanded={creating}
+          >
+            + Group
+          </button>
         </div>
         {creatingContact && (
           <NewContact
@@ -1276,7 +1253,7 @@ export default function App() {
                   <div className="flex justify-between gap-2">
                     <span className="truncate font-bold">
                       {c ? c.displayName : `#${t.title}`}
-                      <span className="b-tag ml-1.5 rounded-full px-1.5 text-[10px] font-normal opacity-70">{c ? c.agentName : 'group'}</span>
+                      <span className="b-tag ml-1.5 rounded-full px-1.5 text-[10px] font-normal opacity-70">{c ? roleOf(c) : 'group'}</span>
                     </span>
                     <span className="shrink-0 text-xs opacity-70">{last && time(last.createdAt)}</span>
                   </div>
@@ -1288,7 +1265,7 @@ export default function App() {
           {visibleThreads.length === 0 && <div className="p-2 text-sm text-muted">No chats match</div>}
         </nav>
         <div className="flex flex-col gap-2">
-          <Meter label="Spent so far" used={totalSpent} cap={totalBudget} />
+          <Meter label="Spent so far" used={totalSpent} />
           <PingsToggle pings={pings} cfg={cfg} onChange={setPings} />
           <label className="flex flex-col gap-1 text-xs font-bold">
             Theme
@@ -1402,7 +1379,7 @@ export default function App() {
                   <div className="min-w-0 flex-1">
                     <div className="title-type truncate text-sm font-bold">{pipContact ? pipContact.displayName : `#${pipThread.title}`}</div>
                     <div className="truncate text-xs text-muted">
-                      {threadNeedsYou(pipThread.id) ? 'Waiting on you' : pipTypers.length ? 'Typing…' : (pipOtherAct?.text ?? pipContact?.agentName ?? 'group')}
+                      {threadNeedsYou(pipThread.id) ? 'Waiting on you' : pipTypers.length ? 'Typing…' : (pipOtherAct?.text ?? (pipContact ? roleOf(pipContact) : 'group'))}
                     </div>
                   </div>
                   <button aria-label="Expand to full window" title="Expand" onClick={() => (window.focus(), pip.close())} className="btn shrink-0 bg-panel px-3 py-1.5 text-sm text-ink">

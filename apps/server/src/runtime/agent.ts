@@ -156,6 +156,8 @@ export type RuntimeHooks = {
   mcpUrl?: string
   /** Bearer token every contact's CLI process must send to that endpoint. */
   mcpToken?: string
+  /** True while an interactive Claude Code process (a terminal) has this session open. */
+  openInTerminal?(sessionId: string): boolean
 }
 
 /** One long-lived `claude` CLI process for one contact. Started on the first message, resumed by session_id. */
@@ -200,8 +202,9 @@ export class AgentRuntime {
     const c = this.contact
     if (!checkClaudeAuth())
       return { contactId: c.id, live: false, reason: 'claude CLI not found or not logged in (run `claude` once to sign in)' }
-    if (c.spentUsd >= c.budgetUsd)
-      return { contactId: c.id, live: false, reason: `${c.displayName} used the $${c.budgetUsd.toFixed(2)} budget` }
+    // Two writers on one session fork its transcript, so wait for the terminal to let go (its turns still mirror in).
+    if (!this.child && c.sessionId && this.hooks.openInTerminal?.(c.sessionId))
+      return { contactId: c.id, live: false, reason: 'open in a terminal right now: exit it there to reply from here' }
     return { contactId: c.id, live: true }
   }
 
@@ -397,16 +400,20 @@ export class AgentRuntime {
       '--permission-mode', c.permissionMode,
       ...(c.permissionMode === 'bypassPermissions' ? ['--allow-dangerously-skip-permissions'] : []),
       ...(c.sessionId ? ['--resume', c.sessionId] : []),
-      '--max-budget-usd', String(Math.max(0, c.budgetUsd - c.spentUsd)),
       // Run the session as the contact's own .claude/agents definition, same as `claude --agent`.
-      '--agents', JSON.stringify({
-        [this.agent.name]: {
-          description: this.agent.description,
-          prompt: `${this.agent.prompt}\n\n${PERSONA}`,
-          tools: this.agent.tools && [...this.agent.tools, HAND_OFF],
-        },
-      }),
-      '--agent', this.agent.name,
+      // A terminal session keeps whatever it was: no agent, no texting persona.
+      ...(this.agent.plain
+        ? []
+        : [
+            '--agents', JSON.stringify({
+              [this.agent.name]: {
+                description: this.agent.description,
+                prompt: `${this.agent.prompt}\n\n${PERSONA}`,
+                tools: this.agent.tools && [...this.agent.tools, HAND_OFF],
+              },
+            }),
+            '--agent', this.agent.name,
+          ]),
       // Agents talk only through gcnb, where you can see it; permission_prompt is internal plumbing, never a callable tool.
       '--disallowedTools', 'SendMessage', 'ListAgents', PERMISSION_PROMPT,
       '--allowedTools', HAND_OFF, // routing is gcnb's own tool; never needs an approval card
@@ -495,7 +502,6 @@ export class AgentRuntime {
               if (group && m.subtype === 'success' && !m.is_error && (m.result as string).trim()) this.post('agent', 'text', (m.result as string).trim(), { costUsd: cost })
               if (group) this.hooks.groupTurnCost(this.threadId, cost)
               if (this.interrupted) this.post('system', 'status', 'Stopped')
-              else if (m.subtype === 'error_max_budget_usd') this.post('system', 'status', 'Paused: budget used up')
               else if (m.subtype !== 'success') this.post('system', 'status', `Turn stopped (${m.subtype})`)
               else if (m.is_error) this.post('system', 'status', `Error: ${m.result}`)
               this.interrupted = false
@@ -506,7 +512,7 @@ export class AgentRuntime {
                 this.restartAfterTurn = false
                 this.close() // also pumps the queue into a fresh process
               } else if (this.queue.length) {
-                // Budget may have run out while these waited.
+                // The CLI may have logged out while these waited.
                 if (this.state().live) this.pump()
                 else this.dropQueue(this.state().reason ?? 'offline')
               } else {

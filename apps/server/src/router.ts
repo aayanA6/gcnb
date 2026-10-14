@@ -97,11 +97,6 @@ export class Router {
       this.line(t.id, contactId, `${name}: not delivered (${state.reason})`)
       return state.reason ?? 'offline'
     }
-    if (t.hourlyCapUsd !== null && this.spentLastHour(t.id) >= t.hourlyCapUsd) {
-      const msg = `Paused: #${t.title} hit its $${t.hourlyCapUsd.toFixed(2)}/hour spend cap`
-      this.line(t.id, contactId, msg)
-      return msg
-    }
     const lead = t.leadContactId ? ` · lead: ${this.db.contact(t.leadContactId)?.agentName ?? t.leadContactId}` : ''
     rt.deliver({ threadId: t.id, text: `[#${t.title} · from ${from}${lead} · members: ${this.names(t)}] ${text}`, hops })
     return null

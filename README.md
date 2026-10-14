@@ -91,7 +91,6 @@ Optional settings:
 | `GCNB_PORT` | `8787` | Server port (always bound to 127.0.0.1) |
 | `GCNB_AGENTS_DIR` | `.claude/agents` | Where contacts come from |
 | `GCNB_MODEL` | `sonnet` | Model for new contacts whose agent file has no `model:` |
-| `GCNB_BUDGET_USD` | `2` | New contacts' spend cap (`maxBudgetUsd`) |
 | `GCNB_CWD` | repo root | Folder new contacts work in |
 | `GCNB_PERMISSION_MODE` | `bypassPermissions` | New contacts' permission mode; override per agent with `permissionMode:` in its file |
 | `GCNB_IDLE_MIN` | `30` | Close an idle contact's process after this many minutes; the next message resumes it |
@@ -101,6 +100,7 @@ Optional settings:
 | `GCNB_ALLOWED_ORIGINS` | — | Extra browser origins allowed on the WebSocket (comma-separated) |
 | `GCNB_WHISPER_URL` | — | Local Whisper server for voice transcription, e.g. `http://127.0.0.1:8080/inference` |
 | `GCNB_WHISPER_MODEL` | — | Model name to send to an OpenAI-style Whisper server that requires one |
+| `GCNB_TERMINAL_DAYS` | `3` | Interactive terminal sessions this recent show up as chats; `0` = off |
 | `GCNB_STOP_AFTER_MIN` | `0` (never) | Stop the server this many minutes after the last browser tab closes |
 | `GCNB_VAPID_SUBJECT` | repo URL | `subject` (mailto: or https: URL) sent with Web Push VAPID details |
 
@@ -117,29 +117,36 @@ Every `.claude/agents/*.md` file becomes a contact: the frontmatter supplies `na
 
 ### New contact
 
-**+ Contact** (next to + Group) opens a form: display name (auto-suggests a contact id, editable), role, instructions, model, working folder, "Before risky tools", a budget, a name color and an optional pfp. **Create** writes `.claude/agents/<id>.md` — the same file format as the shipped contacts, so it's usable outside gcnb too, e.g. `claude --agent <id>` — seeds it in the database and opens its DM.
+**+ Contact** (next to + Group) opens a form: display name (auto-suggests a contact id, editable), role, instructions, model, working folder, "Before risky tools", a name color and an optional pfp. **Create** writes `.claude/agents/<id>.md` — the same file format as the shipped contacts, so it's usable outside gcnb too, e.g. `claude --agent <id>` — seeds it in the database and opens its DM.
 
 ### Terminal hand-off
 
 **Open in terminal** (chat header or contact card) copies `claude --resume <session_id>` *and* tells gcnb to close its own process for that contact first, so the CLI is the only writer — gcnb steps aside instead of racing it for the same session. Turns you ran in the terminal show up in the DM tagged **in terminal** once you come back. Avoid typing to the same contact in both gcnb and a terminal at the same time; hand off instead of running them side by side.
 
+## Terminal sessions
+
+Every interactive `claude` session you ran in a terminal or your IDE in the last **3 days** (`GCNB_TERMINAL_DAYS`, `0` turns it off) shows up as a chat tagged **terminal**, named after its title. Filter them with the **Terminal** pill. Its history imports on first sight, and new turns appear as the terminal writes them, so you can follow a session from your phone.
+
+You can reply once the session isn't open anywhere else: while a terminal has it open, the chat says so and holds off, because two writers on one session fork it. Exit it in the terminal (`/exit`) and your next message resumes it in place, in its own folder, with its own model and permission mode. These sessions stay out of #hq.
+
 ## Manager & #hq
 
 If a `manager.md` agent file exists, every contact is also a member of **#hq**, a group it leads: a post there with no `@mention` goes to the manager, who hands work to the right teammate with `hand_off`. Run the same agent outside gcnb with `claude --agent manager`.
+
+The team files in `.claude/agents/` (manager, planner, coder, reviewer) are written to sound like real coworkers: you're the CEO, they work for you, and they text like people. Their job rules (planner plans, coder builds, reviewer reviews, manager delegates and reports to you) are unchanged. Edit the "Voice" section in each file to change the tone.
 
 ## Group chat
 
 The server routes group chats; no model decides who gets a message:
 - Posting in a group sends your message to each **@mentioned** member, or to the group's lead if you mention no one.
 - Each agent gets it in its own session, prefixed with the group and sender, and its final reply posts to the group.
-- Agents pass work along with a `hand_off(to, message)` tool. A chain pauses after **4** hand-offs without you, each contact runs one turn at a time, and every group has an hourly spend cap.
+- Agents pass work along with a `hand_off(to, message)` tool. A chain pauses after **4** hand-offs without you, and each contact runs one turn at a time. There are no spend caps: agents run on your Claude plan, and the spend shown is for information only.
 
 The repo starts you with **#launch crew** (planner as lead, coder, reviewer). Create more with **+ Group**.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `GCNB_USER_NAME` | `You` | Your name in group message prefixes |
-| `GCNB_GROUP_HOURLY_CAP_USD` | `5` | Default hourly spend cap for new groups |
 
 ## See and steer
 

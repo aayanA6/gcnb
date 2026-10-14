@@ -1,8 +1,8 @@
 // src/index.ts
 import Fastify from "fastify";
 import { WebSocketServer, WebSocket } from "ws";
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync5, statSync as statSync2, writeFileSync as writeFileSync3, rmSync, readdirSync as readdirSync2 } from "node:fs";
-import { join as join5, resolve as resolve3 } from "node:path";
+import { existsSync as existsSync3, mkdirSync, readFileSync as readFileSync6, statSync as statSync3, writeFileSync as writeFileSync3, rmSync, readdirSync as readdirSync3 } from "node:fs";
+import { join as join6, resolve as resolve3 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ../../packages/shared/src/index.ts
@@ -431,6 +431,7 @@ function readSince(path, afterUuid) {
     if (type !== "user" && type !== "assistant") continue;
     const text2 = textOf(m.message?.content);
     if (!text2 || !uuid) continue;
+    if (type === "user" && /^<(command-|local-command-|system-reminder)/.test(text2)) continue;
     out.push({ uuid, type, timestamp: String(m.timestamp ?? ""), text: text2 });
   }
   return out;
@@ -581,8 +582,8 @@ var AgentRuntime = class {
     const c = this.contact;
     if (!checkClaudeAuth())
       return { contactId: c.id, live: false, reason: "claude CLI not found or not logged in (run `claude` once to sign in)" };
-    if (c.spentUsd >= c.budgetUsd)
-      return { contactId: c.id, live: false, reason: `${c.displayName} used the $${c.budgetUsd.toFixed(2)} budget` };
+    if (!this.child && c.sessionId && this.hooks.openInTerminal?.(c.sessionId))
+      return { contactId: c.id, live: false, reason: "open in a terminal right now: exit it there to reply from here" };
     return { contactId: c.id, live: true };
   }
   /** Queue a message for this contact's session. Caller checks state().live first. */
@@ -769,21 +770,22 @@ var AgentRuntime = class {
       c.permissionMode,
       ...c.permissionMode === "bypassPermissions" ? ["--allow-dangerously-skip-permissions"] : [],
       ...c.sessionId ? ["--resume", c.sessionId] : [],
-      "--max-budget-usd",
-      String(Math.max(0, c.budgetUsd - c.spentUsd)),
       // Run the session as the contact's own .claude/agents definition, same as `claude --agent`.
-      "--agents",
-      JSON.stringify({
-        [this.agent.name]: {
-          description: this.agent.description,
-          prompt: `${this.agent.prompt}
+      // A terminal session keeps whatever it was: no agent, no texting persona.
+      ...this.agent.plain ? [] : [
+        "--agents",
+        JSON.stringify({
+          [this.agent.name]: {
+            description: this.agent.description,
+            prompt: `${this.agent.prompt}
 
 ${PERSONA}`,
-          tools: this.agent.tools && [...this.agent.tools, HAND_OFF]
-        }
-      }),
-      "--agent",
-      this.agent.name,
+            tools: this.agent.tools && [...this.agent.tools, HAND_OFF]
+          }
+        }),
+        "--agent",
+        this.agent.name
+      ],
       // Agents talk only through gcnb, where you can see it; permission_prompt is internal plumbing, never a callable tool.
       "--disallowedTools",
       "SendMessage",
@@ -874,7 +876,6 @@ ${PERSONA}`,
               if (group && m.subtype === "success" && !m.is_error && m.result.trim()) this.post("agent", "text", m.result.trim(), { costUsd: cost });
               if (group) this.hooks.groupTurnCost(this.threadId, cost);
               if (this.interrupted) this.post("system", "status", "Stopped");
-              else if (m.subtype === "error_max_budget_usd") this.post("system", "status", "Paused: budget used up");
               else if (m.subtype !== "success") this.post("system", "status", `Turn stopped (${m.subtype})`);
               else if (m.is_error) this.post("system", "status", `Error: ${m.result}`);
               this.interrupted = false;
@@ -1048,11 +1049,6 @@ var Router = class {
       this.line(t.id, contactId, `${name}: not delivered (${state.reason})`);
       return state.reason ?? "offline";
     }
-    if (t.hourlyCapUsd !== null && this.spentLastHour(t.id) >= t.hourlyCapUsd) {
-      const msg = `Paused: #${t.title} hit its $${t.hourlyCapUsd.toFixed(2)}/hour spend cap`;
-      this.line(t.id, contactId, msg);
-      return msg;
-    }
     const lead = t.leadContactId ? ` \xB7 lead: ${this.db.contact(t.leadContactId)?.agentName ?? t.leadContactId}` : "";
     rt.deliver({ threadId: t.id, text: `[#${t.title} \xB7 from ${from}${lead} \xB7 members: ${this.names(t)}] ${text2}`, hops });
     return null;
@@ -1163,19 +1159,151 @@ var Push = class {
   }
 };
 
+// src/terminals.ts
+import { closeSync, existsSync as existsSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync5, readSync, statSync as statSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { basename, join as join5 } from "node:path";
+var claudeDir = () => join5(homedir2(), ".claude");
+var terminalContactId = (sessionId) => `t-${sessionId.slice(0, 8).toLowerCase()}`;
+var isTerminalContact = (id) => id.startsWith("t-");
+function readWindow(path, size, fromEnd) {
+  const fd = openSync(path, "r");
+  try {
+    const len = statSync2(path).size;
+    const n = Math.min(size, len);
+    const buf = Buffer.alloc(n);
+    readSync(fd, buf, 0, n, fromEnd ? len - n : 0);
+    return buf.toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+var parse = (line) => {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+};
+var firstText = (content) => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.find((b) => b?.type === "text" && typeof b.text === "string")?.text ?? "";
+  return "";
+};
+var clip2 = (s, n) => {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > n ? `${one.slice(0, n - 1)}\u2026` : one;
+};
+function readSession(path) {
+  let head, tail;
+  try {
+    head = readWindow(path, 256 * 1024, false);
+    tail = readWindow(path, 128 * 1024, true);
+  } catch {
+    return null;
+  }
+  let cwd = "", entrypoint = "", prompt = "", title = "", model, permissionMode;
+  for (const m of head.split("\n").map(parse)) {
+    if (!m || m.isSidechain) continue;
+    if (!cwd && typeof m.cwd === "string") cwd = m.cwd;
+    if (!entrypoint && typeof m.entrypoint === "string") entrypoint = m.entrypoint;
+    if (!prompt && m.type === "user" && !m.isMeta) {
+      const t = firstText(m.message?.content);
+      if (t && !t.startsWith("<")) prompt = t;
+    }
+  }
+  for (const m of tail.split("\n").map(parse)) {
+    if (!m) continue;
+    if (m.type === "ai-title" && typeof m.aiTitle === "string") title = m.aiTitle;
+    if (m.type === "custom-title" && typeof m.customTitle === "string") title = m.customTitle;
+    if (m.type === "permission-mode" && typeof m.permissionMode === "string") permissionMode = m.permissionMode;
+    const mm = m.message?.model;
+    if (m.type === "assistant" && typeof mm === "string" && mm !== "<synthetic>") model = mm;
+  }
+  if (!cwd || entrypoint.startsWith("sdk") || !existsSync2(cwd)) return null;
+  return {
+    sessionId: basename(path, ".jsonl"),
+    cwd,
+    title: clip2(title || prompt || basename(cwd), 40),
+    model,
+    permissionMode,
+    mtime: statSync2(path).mtimeMs
+  };
+}
+function recentSessions(days, max = 20) {
+  const root2 = join5(claudeDir(), "projects");
+  if (days <= 0 || !existsSync2(root2)) return [];
+  const since = Date.now() - days * 864e5;
+  const files = [];
+  for (const dir of readdirSync2(root2)) {
+    let names;
+    try {
+      names = readdirSync2(join5(root2, dir));
+    } catch {
+      continue;
+    }
+    for (const f of names) {
+      if (!/^[0-9a-f-]{36}\.jsonl$/i.test(f)) continue;
+      const path = join5(root2, dir, f);
+      try {
+        const mtime = statSync2(path).mtimeMs;
+        if (mtime >= since) files.push({ path, mtime });
+      } catch {
+      }
+    }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  const out = [];
+  for (const f of files) {
+    if (out.length >= max) break;
+    const s = readSession(f.path);
+    if (s) out.push(s);
+  }
+  return out;
+}
+var alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+};
+function openSessions() {
+  const out = /* @__PURE__ */ new Map();
+  const dir = join5(claudeDir(), "sessions");
+  let names;
+  try {
+    names = readdirSync2(dir);
+  } catch {
+    return out;
+  }
+  for (const f of names) {
+    if (!/^\d+\.json$/.test(f)) continue;
+    try {
+      const s = JSON.parse(readFileSync5(join5(dir, f), "utf8"));
+      if (String(s.entrypoint ?? "").startsWith("sdk")) continue;
+      if (s.kind === "interactive" && typeof s.sessionId === "string" && Number.isInteger(s.pid) && alive(s.pid)) out.set(s.sessionId, s.pid);
+    } catch {
+    }
+  }
+  return out;
+}
+
 // src/index.ts
 var GROUP_CAP = Number(process.env.GCNB_GROUP_HOURLY_CAP_USD ?? 5);
 var root = fileURLToPath(new URL("../../..", import.meta.url));
 var port = Number(process.env.GCNB_PORT ?? 8787);
-var dataDir = process.env.GCNB_DATA_DIR ?? join5(root, ".gcnb");
-var avatarDir = join5(dataDir, "avatars");
+var dataDir = process.env.GCNB_DATA_DIR ?? join6(root, ".gcnb");
+var avatarDir = join6(dataDir, "avatars");
 mkdirSync(avatarDir, { recursive: true });
-var db = openDb(join5(dataDir, "gcnb.db"));
-var webDir = process.env.GCNB_WEB_DIR ?? join5(root, "apps", "web", "dist");
+var db = openDb(join6(dataDir, "gcnb.db"));
+var webDir = process.env.GCNB_WEB_DIR ?? join6(root, "apps", "web", "dist");
 var WHISPER_URL = process.env.GCNB_WHISPER_URL;
 var STOP_AFTER_MIN = Number(process.env.GCNB_STOP_AFTER_MIN ?? 0);
+var TERMINAL_DAYS = Number(process.env.GCNB_TERMINAL_DAYS ?? 3);
 var COLORS = ["#ffd23f", "#3ddc97", "#ff6b4a", "#b9a5ff", "#5ce1ff"];
-var agentsDir = process.env.GCNB_AGENTS_DIR ?? join5(root, ".claude", "agents");
+var agentsDir = process.env.GCNB_AGENTS_DIR ?? join6(root, ".claude", "agents");
 var agentFiles = loadAgents(agentsDir);
 agentFiles.forEach(
   (a, i) => db.seedContact(
@@ -1228,13 +1356,15 @@ var mcpToken = randomUUID3();
 var mcpUrl = `http://127.0.0.1:${port}/mcp`;
 var runtimes = /* @__PURE__ */ new Map();
 var router = new Router(db, runtimes, broadcast);
+var terminalOpen = openSessions();
 function addRuntime(a) {
   const rt = new AgentRuntime(db, a.name, a, broadcast, {
     handOff: (from, d, to, message) => router.handOff(from, d, to, message),
     groupTurnCost: (threadId, usd) => router.recordSpend(threadId, usd),
     isGroup: (threadId) => threadId.startsWith("g-"),
     mcpUrl,
-    mcpToken
+    mcpToken,
+    openInTerminal: (sessionId) => terminalOpen.has(sessionId)
   });
   runtimes.set(a.name, rt);
   rt.importTerminal();
@@ -1242,12 +1372,51 @@ function addRuntime(a) {
 }
 function syncHq() {
   if (!runtimes.has("manager")) return;
+  const team = [...runtimes.keys()].filter((id) => !isTerminalContact(id));
   const hq = db.threads().find((t) => t.kind === "group" && t.title === "hq");
-  if (hq) db.addMembers(hq.id, [...runtimes.keys()]);
-  else db.createGroup({ title: "hq", contactIds: [...runtimes.keys()], leadContactId: "manager", hourlyCapUsd: GROUP_CAP });
+  if (hq) db.addMembers(hq.id, team);
+  else db.createGroup({ title: "hq", contactIds: team, leadContactId: "manager", hourlyCapUsd: GROUP_CAP });
 }
+function addTerminal(s) {
+  const id = terminalContactId(s.sessionId);
+  if (!db.contact(id)) {
+    db.seedContact(
+      {
+        id,
+        agentName: id,
+        displayName: s.title,
+        avatarPath: null,
+        color: COLORS[runtimes.size % COLORS.length],
+        bio: `Terminal session in ${s.cwd}`,
+        model: s.model ?? process.env.GCNB_MODEL ?? "sonnet",
+        cwd: s.cwd,
+        permissionMode: PERMISSION_MODES.includes(s.permissionMode) ? s.permissionMode : "default",
+        budgetUsd: 0
+        // unused: no spend caps
+      },
+      `dm-${id}`
+    );
+    db.updateContact(id, { sessionId: s.sessionId });
+  }
+  return addRuntime({ name: id, description: "", prompt: "", path: "", plain: true });
+}
+for (const c of db.contacts()) if (isTerminalContact(c.id) && c.sessionId) addRuntime({ name: c.id, description: "", prompt: "", path: "", plain: true });
 for (const a of agentFiles) addRuntime(a);
 registerMcp(app, runtimes, mcpToken);
+var ownSessions = () => new Set(db.contacts().map((c) => c.sessionId).filter(Boolean));
+function scanTerminals() {
+  const before = new Map([...runtimes.values()].map((r) => [r.contactId, JSON.stringify(r.state())]));
+  terminalOpen = openSessions();
+  const owned = ownSessions();
+  let added = false;
+  for (const s of recentSessions(TERMINAL_DAYS)) {
+    if (owned.has(s.sessionId) || runtimes.has(terminalContactId(s.sessionId))) continue;
+    addTerminal(s);
+    added = true;
+  }
+  if (added) return broadcast(snapshot());
+  for (const r of runtimes.values()) if (before.get(r.contactId) !== JSON.stringify(r.state())) broadcast({ type: "agent", agent: r.state() });
+}
 var trio = ["planner", "coder", "reviewer"];
 if (trio.every((id) => runtimes.has(id)) && !db.threads().some((t) => t.kind === "group"))
   db.createGroup({ title: "launch crew", contactIds: trio, leadContactId: "planner", hourlyCapUsd: GROUP_CAP });
@@ -1264,6 +1433,8 @@ var snapshot = () => {
     typing: [...runtimes.values()].filter((r) => r.typing).map((r) => ({ contactId: r.contactId, threadId: r.threadId }))
   };
 };
+scanTerminals();
+setInterval(scanTerminals, 5e3).unref();
 var systemLine = (contactId, text2) => broadcast({ type: "message", message: db.addMessage({ threadId: `dm-${contactId}`, sender: "system", contactId, kind: "status", body: { text: text2 } }) });
 function handle(ev, ws) {
   if (ev.type === "send") return router.post(ev.threadId, ev.text);
@@ -1291,13 +1462,14 @@ function handle(ev, ws) {
   if (ev.permissionMode && ev.permissionMode !== c.permissionMode) patch.permissionMode = ev.permissionMode;
   if (ev.model && ev.model !== c.model) {
     patch.model = ev.model;
-    setAgentModel(agentFiles.find((a) => a.name === c.agentName).path, ev.model);
+    const file = agentFiles.find((a) => a.name === c.agentName);
+    if (file) setAgentModel(file.path, ev.model);
   }
-  if (ev.cwd && resolve3(ev.cwd) !== c.cwd) {
+  if (ev.cwd && resolve3(ev.cwd) !== c.cwd && !isTerminalContact(c.id)) {
     const cwd = resolve3(ev.cwd);
     let isDir = false;
     try {
-      isDir = statSync2(cwd).isDirectory();
+      isDir = statSync3(cwd).isDirectory();
     } catch {
     }
     if (!isDir) return systemLine(c.id, `Folder not found: ${cwd}`);
@@ -1343,14 +1515,15 @@ app.post("/api/contacts", async (req, reply) => {
   const data = parsed.data;
   if (runtimes.has(data.name)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
   const path = agentFilePath(agentsDir, data.name);
-  if (!path || existsSync2(path)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
+  if (!path || existsSync3(path)) return reply.code(409).send({ error: `a contact named "${data.name}" already exists` });
   const cwd = data.cwd ? resolve3(data.cwd) : resolve3(process.env.GCNB_CWD ?? root);
   let isDir = false;
   try {
-    isDir = statSync2(cwd).isDirectory();
+    isDir = statSync3(cwd).isDirectory();
   } catch {
   }
   if (!isDir) return reply.code(400).send({ error: `Folder not found: ${cwd}`, issues: [{ path: ["cwd"], message: `Folder not found: ${cwd}` }] });
+  mkdirSync(agentsDir, { recursive: true });
   writeFileSync3(path, agentFileText({ name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions }));
   const a = { name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions, path };
   db.seedContact(
@@ -1379,8 +1552,8 @@ app.post("/api/contacts/:id/avatar", async (req, reply) => {
   const ext = IMAGE_TYPES[req.headers["content-type"] ?? ""];
   if (!c || !runtimes.has(c.id)) return reply.code(404).send({ error: "no such contact" });
   if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) return reply.code(415).send({ error: "send a png, jpeg, webp or gif" });
-  for (const f of readdirSync2(avatarDir)) if (f.startsWith(`${c.id}.`)) rmSync(join5(avatarDir, f));
-  writeFileSync3(join5(avatarDir, `${c.id}.${ext}`), req.body);
+  for (const f of readdirSync3(avatarDir)) if (f.startsWith(`${c.id}.`)) rmSync(join6(avatarDir, f));
+  writeFileSync3(join6(avatarDir, `${c.id}.${ext}`), req.body);
   db.updateContact(c.id, { avatarPath: `/api/avatars/${c.id}.${ext}?v=${Date.now()}` });
   const contact = db.contact(c.id);
   broadcast({ type: "contact", contact });
@@ -1390,7 +1563,7 @@ app.get("/api/avatars/:file", async (req, reply) => {
   const m = /^([a-z0-9][a-z0-9_-]*)\.(png|jpg|webp|gif)$/i.exec(req.params.file);
   if (!m) return reply.code(404).send();
   try {
-    const body = readFileSync5(join5(avatarDir, req.params.file));
+    const body = readFileSync6(join6(avatarDir, req.params.file));
     const type = Object.entries(IMAGE_TYPES).find(([, e]) => e === m[2].toLowerCase())[0];
     return reply.type(type).header("x-content-type-options", "nosniff").send(body);
   } catch {
@@ -1423,7 +1596,7 @@ app.post("/api/transcribe", async (req, reply) => {
   }
 });
 app.get("/api/health", async () => ({ ok: true, agents: [...runtimes.values()].map((r) => ({ ...r.state(), running: r.running })) }));
-if (existsSync2(join5(webDir, "index.html"))) serveWeb(app, webDir);
+if (existsSync3(join6(webDir, "index.html"))) serveWeb(app, webDir);
 async function shutdown() {
   for (const r of runtimes.values()) r.shutdown();
   await app.close();

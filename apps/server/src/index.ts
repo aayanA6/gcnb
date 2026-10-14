@@ -14,6 +14,7 @@ import { registerMcp } from './mcp.ts'
 import { Router } from './router.ts'
 import { originAllowed, serveWeb } from './http.ts'
 import { Push } from './push.ts'
+import { isTerminalContact, openSessions, recentSessions, terminalContactId, type TerminalSession } from './terminals.ts'
 
 const GROUP_CAP = Number(process.env.GCNB_GROUP_HOURLY_CAP_USD ?? 5)
 
@@ -26,6 +27,7 @@ const db = openDb(join(dataDir, 'gcnb.db'))
 const webDir = process.env.GCNB_WEB_DIR ?? join(root, 'apps', 'web', 'dist')
 const WHISPER_URL = process.env.GCNB_WHISPER_URL // a local Whisper server, e.g. whisper.cpp's /inference
 const STOP_AFTER_MIN = Number(process.env.GCNB_STOP_AFTER_MIN ?? 0) // 0 = keep running with no tabs open
+const TERMINAL_DAYS = Number(process.env.GCNB_TERMINAL_DAYS ?? 3) // terminal sessions this recent become chats; 0 = off
 
 // Contacts = the agent files. New ones are seeded once; after that the DB owns looks, folder, budget, session.
 const COLORS = ['#ffd23f', '#3ddc97', '#ff6b4a', '#b9a5ff', '#5ce1ff']
@@ -94,6 +96,9 @@ const mcpUrl = `http://127.0.0.1:${port}/mcp`
 const runtimes = new Map<string, AgentRuntime>()
 const router = new Router(db, runtimes, broadcast)
 
+// Which sessions an interactive terminal has open, refreshed by the terminal scan below.
+let terminalOpen = openSessions()
+
 // Shared by boot and POST /api/contacts, so a contact created from gcnb gets exactly the same runtime.
 function addRuntime(a: AgentFile) {
   const rt = new AgentRuntime(db, a.name, a, broadcast, {
@@ -102,6 +107,7 @@ function addRuntime(a: AgentFile) {
     isGroup: (threadId) => threadId.startsWith('g-'),
     mcpUrl,
     mcpToken,
+    openInTerminal: (sessionId) => terminalOpen.has(sessionId),
   })
   runtimes.set(a.name, rt)
   rt.importTerminal() // the contact may already have a session from a previous run
@@ -109,15 +115,62 @@ function addRuntime(a: AgentFile) {
 }
 
 // The manager (if there is one) leads #hq, a group of every contact; agents added later join it.
+// Terminal sessions stay out of it: they're your own conversations, not teammates.
 function syncHq() {
   if (!runtimes.has('manager')) return
+  const team = [...runtimes.keys()].filter((id) => !isTerminalContact(id))
   const hq = db.threads().find((t) => t.kind === 'group' && t.title === 'hq')
-  if (hq) db.addMembers(hq.id, [...runtimes.keys()])
-  else db.createGroup({ title: 'hq', contactIds: [...runtimes.keys()], leadContactId: 'manager', hourlyCapUsd: GROUP_CAP })
+  if (hq) db.addMembers(hq.id, team)
+  else db.createGroup({ title: 'hq', contactIds: team, leadContactId: 'manager', hourlyCapUsd: GROUP_CAP })
 }
+
+// A terminal session as a contact: its own folder, model and permission mode, resumed as-is (plain).
+// Its whole transcript imports on first sight (cursor null), then new turns mirror in as they're written.
+function addTerminal(s: TerminalSession) {
+  const id = terminalContactId(s.sessionId)
+  if (!db.contact(id)) {
+    db.seedContact(
+      {
+        id,
+        agentName: id,
+        displayName: s.title,
+        avatarPath: null,
+        color: COLORS[runtimes.size % COLORS.length],
+        bio: `Terminal session in ${s.cwd}`,
+        model: s.model ?? process.env.GCNB_MODEL ?? 'sonnet',
+        cwd: s.cwd,
+        permissionMode: PERMISSION_MODES.includes(s.permissionMode as never) ? s.permissionMode! : 'default',
+        budgetUsd: 0, // unused: no spend caps
+      },
+      `dm-${id}`,
+    )
+    db.updateContact(id, { sessionId: s.sessionId })
+  }
+  return addRuntime({ name: id, description: '', prompt: '', path: '', plain: true })
+}
+
+// Boot: every terminal chat seen before (even if it's gone quiet since), then anything new.
+for (const c of db.contacts()) if (isTerminalContact(c.id) && c.sessionId) addRuntime({ name: c.id, description: '', prompt: '', path: '', plain: true })
 
 for (const a of agentFiles) addRuntime(a)
 registerMcp(app, runtimes, mcpToken)
+
+// Rescan every few seconds: new terminal sessions appear as chats, and a contact whose session a
+// terminal just opened or closed flips between "open in a terminal" and live.
+const ownSessions = () => new Set(db.contacts().map((c) => c.sessionId).filter(Boolean))
+function scanTerminals() {
+  const before = new Map([...runtimes.values()].map((r) => [r.contactId, JSON.stringify(r.state())]))
+  terminalOpen = openSessions()
+  const owned = ownSessions()
+  let added = false
+  for (const s of recentSessions(TERMINAL_DAYS)) {
+    if (owned.has(s.sessionId) || runtimes.has(terminalContactId(s.sessionId))) continue
+    addTerminal(s)
+    added = true
+  }
+  if (added) return broadcast(snapshot())
+  for (const r of runtimes.values()) if (before.get(r.contactId) !== JSON.stringify(r.state())) broadcast({ type: 'agent', agent: r.state() })
+}
 
 // Starter group for the trio, so the planner -> coder -> reviewer hand-off chain works out of the box.
 const trio = ['planner', 'coder', 'reviewer']
@@ -140,6 +193,9 @@ const snapshot = (): ServerEvent => {
     typing: [...runtimes.values()].filter((r) => r.typing).map((r) => ({ contactId: r.contactId, threadId: r.threadId })),
   }
 }
+
+scanTerminals()
+setInterval(scanTerminals, 5_000).unref()
 
 const systemLine = (contactId: string, text: string) =>
   broadcast({ type: 'message', message: db.addMessage({ threadId: `dm-${contactId}`, sender: 'system', contactId, kind: 'status', body: { text } }) })
@@ -174,9 +230,10 @@ function handle(ev: ClientEvent, ws: WebSocket) {
   if (ev.permissionMode && ev.permissionMode !== c.permissionMode) patch.permissionMode = ev.permissionMode
   if (ev.model && ev.model !== c.model) {
     patch.model = ev.model
-    setAgentModel(agentFiles.find((a) => a.name === c.agentName)!.path, ev.model)
+    const file = agentFiles.find((a) => a.name === c.agentName)
+    if (file) setAgentModel(file.path, ev.model) // terminal sessions have no agent file
   }
-  if (ev.cwd && resolve(ev.cwd) !== c.cwd) {
+  if (ev.cwd && resolve(ev.cwd) !== c.cwd && !isTerminalContact(c.id)) { // a terminal session lives in its own folder
     const cwd = resolve(ev.cwd)
     let isDir = false
     try {
@@ -242,6 +299,7 @@ app.post('/api/contacts', async (req, reply) => {
     isDir = statSync(cwd).isDirectory()
   } catch {}
   if (!isDir) return reply.code(400).send({ error: `Folder not found: ${cwd}`, issues: [{ path: ['cwd'], message: `Folder not found: ${cwd}` }] })
+  mkdirSync(agentsDir, { recursive: true }) // a fresh project has no .claude/agents yet
   writeFileSync(path, agentFileText({ name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions }))
   const a: AgentFile = { name: data.name, description: data.description, model: data.model, permissionMode: data.permissionMode, prompt: data.instructions, path }
   db.seedContact(

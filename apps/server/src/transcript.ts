@@ -69,6 +69,7 @@ export function readSince(path: string, afterUuid: string | null): TranscriptLin
     if (type !== 'user' && type !== 'assistant') continue
     const text = textOf((m.message as { content?: unknown } | undefined)?.content)
     if (!text || !uuid) continue
+    if (type === 'user' && /^<(command-|local-command-|system-reminder)/.test(text)) continue // slash-command plumbing, not a message
     out.push({ uuid, type, timestamp: String(m.timestamp ?? ''), text })
   }
   return out

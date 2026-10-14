@@ -11,6 +11,8 @@ export type AgentFile = {
   permissionMode?: string
   prompt: string
   path: string
+  /** A terminal session picked up as-is (see terminals.ts): resume it without gcnb's --agent persona. */
+  plain?: boolean
 }
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/
